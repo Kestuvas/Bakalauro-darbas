@@ -1,0 +1,203 @@
+import os
+import numpy as np
+from Bio.PDB import PDBParser, Selection
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.distance import euclidean
+
+eksperimentiniu_dir = "/home/kristupas/Projektai/tsts/eksperimentiniai_pdb_failai_atsisiusti"
+sugeneruotu_dir = "/home/kristupas/Projektai/tsts/eksperimentiniai_pdb_failai_sugeneruoti"
+
+MAX_SIZE_RATIO = 1.5  
+MAX_ACCEPTABLE_RMSD = 5.0  
+MIN_CHAIN_SIZE = 20  
+MAX_SIZE_DIFFERENCE = 50  
+
+parser = PDBParser(QUIET=True)
+
+def validate_structure_size(exp_size, gen_size):
+    if exp_size == 0 or gen_size == 0:
+        return False, "Zero-size structure detected"
+    
+    ratio = max(exp_size, gen_size) / min(exp_size, gen_size)
+    if ratio > MAX_SIZE_RATIO:
+        return False, f"Size ratio ({ratio:.2f}) exceeds maximum allowed ({MAX_SIZE_RATIO})"
+    
+    if abs(exp_size - gen_size) > MAX_SIZE_DIFFERENCE:
+        return False, f"Size difference ({abs(exp_size - gen_size)}) exceeds maximum allowed ({MAX_SIZE_DIFFERENCE})"
+    
+    return True, "OK"
+
+def gauti_grandines_koordinates(struktura):
+    grandines = {}
+    for modelis in struktura:
+        for grandine in modelis:
+            ca_coords = []
+            for liekana in grandine:
+                if "CA" in liekana:
+                    ca_coords.append(liekana["CA"].coord)
+            if len(ca_coords) >= MIN_CHAIN_SIZE:
+                grandines[grandine.id] = np.array(ca_coords)
+    return grandines
+
+def select_best_chain(struktura, target_size):
+    best_chain = None
+    min_diff = float('inf')
+    best_size = 0
+    grandines = gauti_grandines_koordinates(struktura)
+    
+    for chain_id, coords in grandines.items():
+        chain_size = len(coords)
+        diff = abs(chain_size - target_size)
+        
+        valid, _ = validate_structure_size(chain_size, target_size)
+        if valid and diff < min_diff:
+            min_diff = diff
+            best_chain = chain_id
+            best_size = chain_size
+    
+    return best_chain, min_diff, best_size
+
+def istraukti_segmentus(koordinates, riba=4.0, max_segmento_dydis=None):
+    if len(koordinates) == 0:
+        return []
+        
+    segmentai = []
+    dabartinis_segmentas = [koordinates[0]]
+    
+    for i in range(1, len(koordinates)):
+        if np.linalg.norm(koordinates[i] - koordinates[i - 1]) < riba:
+            dabartinis_segmentas.append(koordinates[i])
+        else:
+            if len(dabartinis_segmentas) >= 5:
+                if max_segmento_dydis and len(dabartinis_segmentas) > max_segmento_dydis:
+                    
+                    for j in range(0, len(dabartinis_segmentas), max_segmento_dydis):
+                        sub_segment = dabartinis_segmentas[j:j + max_segmento_dydis]
+                        if len(sub_segment) >= 5:
+                            segmentai.append(np.array(sub_segment))
+                else:
+                    segmentai.append(np.array(dabartinis_segmentas))
+            dabartinis_segmentas = [koordinates[i]]
+    
+    if len(dabartinis_segmentas) >= 5:
+        if max_segmento_dydis and len(dabartinis_segmentas) > max_segmento_dydis:
+            for j in range(0, len(dabartinis_segmentas), max_segmento_dydis):
+                sub_segment = dabartinis_segmentas[j:j + max_segmento_dydis]
+                if len(sub_segment) >= 5:
+                    segmentai.append(np.array(sub_segment))
+        else:
+            segmentai.append(np.array(dabartinis_segmentas))
+    
+    return segmentai
+
+def kabsch_rmsd(P, Q):
+    if len(P) != len(Q):
+        raise ValueError(f"Arrays must have equal length. P: {len(P)}, Q: {len(Q)}")
+    
+    P_centr = P - P.mean(axis=0)
+    Q_centr = Q - Q.mean(axis=0)
+
+    C = np.dot(np.transpose(P_centr), Q_centr)
+    V, S, W = np.linalg.svd(C)
+    d = (np.linalg.det(V) * np.linalg.det(W)) < 0.0
+    if d:
+        V[:, -1] = -V[:, -1]
+    U = np.dot(V, W)
+    P_pasuktas = np.dot(P_centr, U)
+    rmsd = np.sqrt(np.mean(np.sum((P_pasuktas - Q_centr)**2, axis=1)))
+    return rmsd
+
+def atitikti_pagal_pdb_id():
+    eksperimentiniai_failai = {f[:4]: os.path.join(eksperimentiniu_dir, f) for f in os.listdir(eksperimentiniu_dir) if f.endswith(".pdb")}
+    sugeneruoti_failai = {f[:4]: os.path.join(sugeneruotu_dir, f) for f in os.listdir(sugeneruotu_dir) if f.endswith(".pdb")}
+
+    bendri_id = set(eksperimentiniai_failai.keys()) & set(sugeneruoti_failai.keys())
+    return [(eksperimentiniai_failai[i], sugeneruoti_failai[i]) for i in sorted(bendri_id)]
+
+for eksperimentinis_kelias, sugeneruotas_kelias in atitikti_pagal_pdb_id():
+    print(f"\nPalyginimas: {os.path.basename(eksperimentinis_kelias)}")
+    try:
+        eksperimentine_struktura = parser.get_structure('eks', eksperimentinis_kelias)
+        sugeneruota_struktura = parser.get_structure('sug', sugeneruotas_kelias)
+        
+        sugeneruotos_grandines = gauti_grandines_koordinates(sugeneruota_struktura)
+        if not sugeneruotos_grandines:
+            print("Nerasta CA atomų sugeneruotoje struktūroje")
+            continue
+          
+        sugeneruotos_dydis = len(next(iter(sugeneruotos_grandines.values())))
+        
+        best_chain, diff, exp_size = select_best_chain(eksperimentine_struktura, sugeneruotos_dydis)
+        
+        if best_chain is None:
+            print("Nerasta tinkamų grandinių eksperimentinėje struktūroje")
+            continue
+        
+        valid, message = validate_structure_size(exp_size, sugeneruotos_dydis)
+        if not valid:
+            print(f"Struktūrų dydžių nesuderinamumas: {message}")
+            continue
+            
+        print(f"Pasirinkta grandinė: {best_chain} (dydžių skirtumas: {diff})")
+        
+        grandines = gauti_grandines_koordinates(eksperimentine_struktura)
+        eksperimentines_ca = grandines[best_chain]
+        sugeneruotos_ca = next(iter(sugeneruotos_grandines.values()))
+        
+        print(f"CA atomų skaičius: eksperimentinis={len(eksperimentines_ca)}, sugeneruotas={len(sugeneruotos_ca)}")
+        
+        max_segmento_dydis = min(len(sugeneruotos_ca), len(eksperimentines_ca))
+        segmentai = istraukti_segmentus(eksperimentines_ca, max_segmento_dydis=max_segmento_dydis)
+        
+        if not segmentai:
+            print("Nerasta tinkamų segmentų")
+            continue
+            
+        print(f"Rasta segmentų: {len(segmentai)}")
+        
+        fragmentai = []
+        fragmentu_indeksai = []
+        
+        for i, segmentas in enumerate(segmentai):
+            ilgis = len(segmentas)
+            if len(sugeneruotos_ca) < ilgis:
+                print(f"Segmentas {i} per ilgas ({ilgis}) lyginant su sugeneruota struktūra ({len(sugeneruotos_ca)})")
+                continue
+                
+            fragmentu_rmsd = []
+            for j in range(len(sugeneruotos_ca) - ilgis + 1):
+                fragmentas = sugeneruotos_ca[j:j+ilgis]
+                rmsd = kabsch_rmsd(segmentas, fragmentas)
+                fragmentu_rmsd.append([fragmentas, [j,j+ilgis-1], rmsd])
+                
+            if fragmentu_rmsd:
+                surikiuoti = sorted(fragmentu_rmsd, key=lambda x: x[2])
+                for fr in surikiuoti:
+                    if len(fragmentu_indeksai) == 0:
+                        fragmentai.append(fr[0])
+                        fragmentu_indeksai.append(fr[1])
+                        break
+                    else:
+                        if fr[1][0] > fragmentu_indeksai[-1][1]:
+                            fragmentai.append(fr[0])
+                            fragmentu_indeksai.append(fr[1])
+                            break
+        
+        if fragmentai:
+            P = np.concatenate(segmentai)
+            Q = np.concatenate(fragmentai)
+            if len(P) != len(Q):
+                print(f"Neatitinka ilgiai: eksperimentiniai segmentai ({len(P)}) vs sugeneruoti fragmentai ({len(Q)})")
+                continue
+            
+            geriausias_rmsd = kabsch_rmsd(P, Q)
+            print(f"Geriausias RMSD: {geriausias_rmsd:.3f} ({len(P)} CA atomų)")
+            
+            if geriausias_rmsd > MAX_ACCEPTABLE_RMSD:
+                print(f"ĮSPĖJIMAS: Didelis RMSD ({geriausias_rmsd:.3f} > {MAX_ACCEPTABLE_RMSD})")
+        else:
+            print("Nerasta tinkamų fragmentų")
+            
+    except Exception as klaida:
+        print(f"Klaida su failu {eksperimentinis_kelias}:")
+        print(str(klaida))

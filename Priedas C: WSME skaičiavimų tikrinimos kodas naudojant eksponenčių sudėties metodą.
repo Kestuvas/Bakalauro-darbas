@@ -1,0 +1,144 @@
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+from itertools import product
+import time
+
+def logsumexp(arr):
+    arr = np.asanyarray(arr)
+    if arr.size == 0: return -np.inf
+    m = np.nanmax(arr)
+    if not np.isfinite(m) or np.all(np.isneginf(arr)): return -np.inf
+    return m + math.log(np.sum(np.exp(arr - m)))
+
+class WSME:
+    def __init__(self, seka, hb, dg, s_liekanos_nuostolis, enma):
+        self.seka = seka
+        self.n = len(seka)
+        self.R = 0.001987
+        self.epsilon_matrica = self._sukurti_kontaktus_pagal_enma(hb, dg, enma)
+        self.s_masyvas = np.full(self.n, s_liekanos_nuostolis)
+        self._prieskaiciuoti_segmentus()
+
+    def _sukurti_kontaktus_pagal_enma(self, hb, dg, enma):
+        m = np.zeros((self.n, self.n))
+        for i in range(self.n):
+            for j in range(self.n):
+                vertė = enma[i, j]
+                if vertė != 0:
+                    if vertė == 'hb': m[i, j] = hb
+                    elif vertė == 'dg': m[i, j] = dg
+                    elif vertė == 'hb+dg': m[i, j] = hb + dg
+        return m + m.T
+
+    def _prieskaiciuoti_segmentus(self):
+        n = self.n
+        self.E_kontaktu = np.zeros((n, n))
+        self.S_suma = np.zeros((n, n))
+        prefix_s = np.concatenate(([0.0], np.cumsum(self.s_masyvas)))
+        for i in range(n):
+            for j in range(i, n):
+                E = 0.0
+                for a in range(i, j + 1):
+                    for b in range(a + 1, j + 1):
+                        E += self.epsilon_matrica[a, b]
+                self.E_kontaktu[i, j] = E
+                self.S_suma[i, j] = prefix_s[j+1] - prefix_s[i]
+
+    def deltaG_segmento(self, i, j, T):
+        return self.E_kontaktu[i, j] - T * self.S_suma[i, j]
+
+    def Fn_profilis(self, T):
+        beta = 1.0 / (self.R * T)
+        Z_pagal_n_aa = {k: 0.0 for k in range(self.n + 1)}
+
+        for busena in product([0, 1], repeat=self.n):
+            G_busenos = 0.0
+            n_aa = sum(busena)
+            
+            i = 0
+            while i < self.n:
+                if busena[i] == 1:
+                    start_idx = i
+                    j = i
+                    while j < self.n and busena[j] == 1:
+                        j += 1
+                    end_idx = j - 1
+                    G_busenos += self.deltaG_segmento(start_idx, end_idx, T)
+                    i = j
+                else:
+                    i += 1
+
+            svoris = math.exp(-beta * G_busenos)
+            Z_pagal_n_aa[n_aa] += svoris
+        
+        aminorugsciu_skaiciai = np.array(list(Z_pagal_n_aa.keys()))
+        Z_profilis = np.array(list(Z_pagal_n_aa.values()))
+
+        F_profilis = np.full_like(Z_profilis, np.inf)
+        valid_mask = Z_profilis > 1e-12
+        F_profilis[valid_mask] = -self.R * T * np.log(Z_profilis[valid_mask])
+        
+        F_profilis -= F_profilis[0]
+        
+        return aminorugsciu_skaiciai, F_profilis
+
+
+if __name__ == "__main__":
+    hb = -1.09
+    dg = -2.03
+    s_conf = -0.00312
+    T_profilio = 297.0
+    
+    enma = np.array([
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 'hb', 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 0, 0, 0, 0, 'hb', 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 'dg', 0, 'hb+dg', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 0, 0, 'hb', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 'hb+dg', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+        [0, 'hb', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ['hb', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ], dtype=object)
+
+    
+    seka = list("GEWTYDDATKTFTVT") 
+    print(f"Naudojama seka: {''.join(seka)} (ilgis: {len(seka)})")
+    
+    modelis = WSME(seka, hb=hb, dg=dg, s_liekanos_nuostolis=s_conf, enma=enma)
+    
+    print("Skaičiuojamas F(n) profilis")
+    start_time = time.time()
+    aminorugsciu_skaiciai, F_profilis = modelis.Fn_profilis(T=T_profilio)
+    end_time = time.time()
+    print(f"Skaičiavimai baigti per {end_time - start_time:.2f} sekundes.")
+
+    plt.figure(figsize=(10, 7))
+    plt.plot(aminorugsciu_skaiciai, F_profilis, marker='o', linestyle='-', color='red', label='Brute-Force, 15aa')
+    plt.title(f'Laisvosios energijos profilis F(n) ties T={T_profilio} K', fontsize=15)
+    plt.xlabel('Aminorūgščių natyvioje būsenoje skaičius (n)', fontsize=12)
+    plt.ylabel('Laisvoji energija ΔF(n) [kcal/mol]', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.axhline(0, color='black', linewidth=0.8)
+    plt.xlim(left=-0.5, right=15.5)
+    plt.xticks(np.arange(0, 16, 1))
+
+    if len(F_profilis) > 1:
+        min_idx = np.argmin(F_profilis[1:]) + 1
+        min_energija = F_profilis[min_idx]
+        min_n = aminorugsciu_skaiciai[min_idx]
+        plt.annotate(f'Minimumas: n={min_n}\nΔF = {min_energija:.2f} kcal/mol',
+                     xy=(min_n, min_energija),
+                     xytext=(min_n - 5, min_energija + 1.5),
+                     arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=8),
+                     bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="black", lw=1, alpha=0.8))
+
+    plt.legend()
+    plt.show()

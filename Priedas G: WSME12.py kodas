@@ -1,0 +1,280 @@
+ OUTLIER SECES: Blogiausi: {blogiausi_sarasas}")
+    
+    istorija.append({
+        'iteracija': iteracija,
+        'rmse': tikras_rmse_total,
+        'koreliacija': r_val,
+        'alpha_vdw': params[0],
+        'alpha_el': params[1],    
+        'alpha_pol': params[2],   
+        'alpha_npol': params[3],
+        'beta_vdw': params[4],    
+        'disulfido_e': params[5], 
+        'vid_klaida_Tm': vid_klaida_Tm,
+        'vid_klaida_barjero': vid_klaida_barjero,
+        'blogiausias_pdb': blogiausias['PDB_id'],
+        'blogiausio_klaida': blogiausias['bendra_klaida']
+    })
+    
+    return bendra_klaida_optimizatoriui
+
+def paruošti_viena_baltyma(row_data):
+    pdb_id = str(row_data['PDB_id']).strip().upper()
+    try:
+        pdb_failas = f"{pdb_id}.pdb"
+        data_dir = os.path.join("saveiku_energija_final", pdb_id, "tarpiniai_failai")
+        failu_sablonas = f"mmpbsa_work_R*/_MMPBSA_complex_gb.mdout.0"
+        
+        if not os.path.exists(pdb_failas) or not os.path.exists(data_dir):
+            return None
+
+        vdw_mat, elec_mat, pol_mat, npol_mat, baltymo_ilgis = nuskaityti_mmpbsa_padalinta(data_dir, failu_sablonas)
+        kontaktu_mask, cys_pairs, seka, sasa = gauti_sasa_ir_struktura(
+            pdb_failas, baltymo_ilgis, atstumo_riba=8.0
+        )
+
+        Tm_K = float(str(row_data['Tm_C']).replace(',', '.')) + 273.15
+        dH = parse_energy(row_data.get('dH', np.nan))
+        dG = parse_energy(row_data.get('dG_exp', np.nan))
+
+        return {
+            'PDB_id': pdb_id, 'ilgis': baltymo_ilgis,
+            'vdw_raw': vdw_mat, 'elec_raw': elec_mat, 
+            'pol_raw': pol_mat, 'npol_raw': npol_mat,
+            'kontaktu_baze': kontaktu_mask,
+            'seka': seka, 'cys': cys_pairs, 'sasa': sasa,
+            'Tm_K': Tm_K, 'dH': dH, 'dG': dG
+        }
+    except Exception as e:
+        print(f"Klaida ruošiant {pdb_id}: {e}")
+        return None
+
+def apskaiciuoti_ir_braizyti_baltyma(baltymas, params, output_dir, sekos_atstumas=4):
+    pdb_id = baltymas['PDB_id']
+    try:
+        alpha_vdw, alpha_el, alpha_pol, alpha_npol, beta_vdw, disulfido_energija = params[:6]
+        entropijos = params[6:]
+        
+        kontaktu_matrica = baltymas['kontaktu_baze'].copy()
+        for k in range(sekos_atstumas):
+            np.fill_diagonal(kontaktu_matrica[k:], 0)
+            np.fill_diagonal(kontaktu_matrica[:, k:], 0)
+            
+        vdw_mat = baltymas['vdw_raw'] * kontaktu_matrica
+        elec_mat = baltymas['elec_raw'] * kontaktu_matrica
+        pol_mat = baltymas['pol_raw'] * kontaktu_matrica
+        npol_mat = baltymas['npol_raw'] * kontaktu_matrica
+
+        modelis = WSME_TransferMatrix_V2_NumPyNumba(
+            baltymas['ilgis'], vdw_mat, elec_mat, 
+            pol_mat, npol_mat,
+            baltymas['seka'], baltymas['cys'], baltymas['sasa'],
+            alpha_vdw=alpha_vdw, 
+            alpha_el=alpha_el, 
+            alpha_pol=alpha_pol,
+            alpha_npol=alpha_npol,
+            beta_vdw=beta_vdw,
+            entropijos_v=entropijos,
+            disulfido_energija=disulfido_energija
+        )
+
+        T_kambario = 298.15
+        Fn_abs_298 = modelis.generuoti_Fn_profili(T_kambario)
+        Fn_profilis_298 = Fn_abs_298 - Fn_abs_298[0] 
+        barjeras_idx_fiksuotas = modelis._rasti_barjera(Fn_profilis_298)
+
+        eksperimentine_Tm_K = baltymas['Tm_K']
+        dG_298_modelis = modelis.gauti_delta_G_unfolding(298.15, barjeras_idx_fiksuotas)
+        dH_Tm_modelio = modelis.gauti_delta_H_unfolding(eksperimentine_Tm_K, fiksuotas_barjeras=barjeras_idx_fiksuotas)
+        dG_Tm_eksp_modelis = modelis.gauti_delta_G_unfolding(eksperimentine_Tm_K, barjeras_idx_fiksuotas)
+
+        def get_dG_T(T): return modelis.gauti_delta_G_unfolding(T, barjeras_idx_fiksuotas)
+            
+        try:
+            Tm_opt = root_scalar(get_dG_T, bracket=[250, 450], method='brentq')
+            Tm_modelio = Tm_opt.root
+        except ValueError:
+            Tm_modelio = eksperimentine_Tm_K
+
+        T_min = max(250, Tm_modelio - 70)
+        T_max = Tm_modelio + 60
+        T_range = np.linspace(T_min, T_max, 100)
+        dG_values = [modelis.gauti_delta_G_unfolding(T, barjeras_idx_fiksuotas) for T in T_range]
+
+        barjeras_idx = barjeras_idx_fiksuotas
+           
+        fig, (ax2, ax3) = plt.subplots(2, 1, figsize=(10, 10))
+
+        ax2.plot(T_range, dG_values, '-', color='blue', linewidth=2)
+        ax2.axhline(0, color='black', linewidth=1, linestyle='--')
+
+        ax2.plot(Tm_modelio, 0, 'ko')
+        ax2.annotate(
+            f'Tm(ΔG=0) = {Tm_modelio:.1f} K',
+            xy=(Tm_modelio, 0),
+            xytext=(Tm_modelio + 5, max(dG_values) * 0.3),
+            arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=8),
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", lw=1)
+        )
+        ax2.set_xlabel('Temperatūra (K)', fontsize=12)
+        ax2.set_ylabel(r'$\Delta G_{U-N}$ [kcal/mol]', fontsize=12)
+        ax2.set_title(rf'{pdb_id} ($\alpha_v$={alpha_vdw:.2f}, $\alpha_e$={alpha_el:.2f}, $\alpha_p$={alpha_pol:.2f}, $\alpha_{{np}}$={alpha_npol:.2f}, $Cys$={disulfido_energija:.1f})', fontsize=14)
+        ax2.grid(True, linestyle='--', alpha=0.5)
+
+        n_range = np.arange(baltymas['ilgis'] + 1)
+        ax3.plot(n_range, Fn_profilis_298, '-', color='purple', linewidth=2)
+        ax3.axvline(barjeras_idx, color='gray', linestyle='--', label=f'Barjeras TS (n={barjeras_idx})')
+        ax3.plot(barjeras_idx, Fn_profilis_298[barjeras_idx], 'k*', markersize=10)
+        ax3.annotate(
+            f'{Fn_profilis_298[barjeras_idx]:.1f} kcal/mol',
+            xy=(barjeras_idx, Fn_profilis_298[barjeras_idx]),
+            xytext=(barjeras_idx - 10, Fn_profilis_298[barjeras_idx] + 1.5),
+            arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=5)
+        )
+        ax3.set_title(f'{pdb_id} F(n) profilis ties 298.15 K (25 °C)', fontsize=14)
+        ax3.set_xlabel('Aminorūgščių natyvioje būsenoje skaičius (n)', fontsize=12)
+        ax3.set_ylabel('G [kcal/mol]', fontsize=12)
+        ax3.legend()
+        ax3.grid(True, linestyle='--', alpha=0.5)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"{pdb_id}_WSME_grafikas.png"), dpi=150)
+        plt.close(fig)
+
+        return {
+            'PDB_id': pdb_id,
+            'Tm_K (Eksp)': eksperimentine_Tm_K,
+            'dH_kcal (Eksp)': baltymas['dH'],
+            'dG_kcal (Eksp)': baltymas['dG'],
+            'Tm_K (Modelio)': Tm_modelio,
+            'dH_kcal (Modelio)': dH_Tm_modelio,
+            'dG_298K (Modelio)': dG_298_modelis,
+            'dG_Tm_eksp (Modelio)': dG_Tm_eksp_modelis,
+            'Statusas': 'OK'
+        }
+    except Exception as e:
+        return {'PDB_id': pdb_id, 'Statusas': f'Klaida braižant: {str(e)}'}
+
+if __name__ == "__main__":
+    OUTPUT_DIR = "WSME_rezultatai"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    csv_file = "priedas_a.csv"
+    if not os.path.exists(csv_file):
+        print(f"KLAIDA: Nerastas failas '{csv_file}'.")
+        exit()
+
+    print(f"1. Skaitomas duomenų failas: {csv_file}")
+    df_priedas = pd.read_csv(csv_file)
+    df_priedas.to_csv(os.path.join(OUTPUT_DIR, "Priedas_A_kopija.csv"), index=False)
+    
+    uzduotys = [row for _, row in df_priedas.iterrows()]
+    paruosti_duomenys = []
+    print(f"Ieškoma struktūrų ir mmpbsa matricų {len(uzduotys)} baltymams...")
+    start_time = time.time()
+    
+    with ProcessPoolExecutor(max_workers=16) as executor:
+        ateities_pasiruosimai = {executor.submit(paruošti_viena_baltyma, r): r for r in uzduotys}
+        for future in as_completed(ateities_pasiruosimai):
+            res = future.result()
+            if res is not None:
+                paruosti_duomenys.append(res)
+                
+    print(f"Duomenų paruošimas baigtas per {(time.time() - start_time):.1f} sek. Sėkmingai pakrauta {len(paruosti_duomenys)} baltymų matricos.")
+
+    if not paruosti_duomenys:
+        print("Klaida: Nepavyko nuskaityti nė vieno baltymo duomenų.")
+        exit()
+
+    print(f"\n2. Pradedama globali parametrų optimizacija (Differential Evolution)...")
+    
+    # Parametrai: alpha_vdw, alpha_el, alpha_pol, alpha_npol, beta_vdw, disulfido_energija + 20 entropijų
+    bounds = [
+        (0.01, 1.5),   # alpha_vdw 
+        (0.01, 1.5),   # alpha_el 
+        (0.01, 1.5),   # alpha_pol
+        (0.01, 1.5),   # alpha_npol
+        (-2.0, 2.0),   # beta_vdw 
+        (-20.0, -5.0), # disulfido_energija 
+    ]
+    bounds += [(0.001, 0.02) for _ in range(20)] 
+    
+    with ProcessPoolExecutor(max_workers=16) as eval_pool:
+        rezultatas = differential_evolution(
+            globali_tikslo_funkcija, 
+            bounds=bounds, 
+            args=(paruosti_duomenys, eval_pool), 
+            strategy='best1bin', 
+            maxiter=60,      
+            popsize=15,       
+            disp=True
+        )
+    
+    globalus_params = rezultatas.x
+    
+    df_istorija = pd.DataFrame(istorija)
+    df_istorija.to_csv(os.path.join(OUTPUT_DIR, "optimizacijos_istorija.csv"), index=False)
+    
+    print("\n" + "="*50)
+    print("GLOBALŪS PARAMETRAI RASTI!")
+    print(f"Alpha VDW:           {globalus_params[0]:.4f}")
+    print(f"Alpha ELEC:          {globalus_params[1]:.4f}")
+    print(f"Alpha POLAR:         {globalus_params[2]:.4f}")
+    print(f"Alpha NPOLAR:        {globalus_params[3]:.4f}")
+    print(f"Beta VDW:            {globalus_params[4]:.4f}")
+    print(f"Cys-Cys E:           {globalus_params[5]:.4f}")
+    print(f"Sekos Atstumas:      4 (FIKSUOTAS)")
+    
+    print("\nEntropijos (20 aminorūgščių):")
+    aa_keys = list(amino_acid_to_number.keys())
+    entropijos_rastos = globalus_params[6:]
+    for i, aa in enumerate(aa_keys):
+        print(f"  {aa}: {entropijos_rastos[i]:.5f}")
+        
+    print(f"\nOptimizacijos istorija išsaugota: optimizacijos_istorija.csv")
+    
+    print(f"\n3. Skaičiuojami rezultatai kiekvienam baltymui...")
+    rezultatai = []
+    rez_csv_path = os.path.join(OUTPUT_DIR, "WSME_Globalus_Rezultatai.csv")
+
+    with ProcessPoolExecutor(max_workers=16) as executor:
+        ateities_uzduotys = {
+            executor.submit(apskaiciuoti_ir_braizyti_baltyma, db, globalus_params, OUTPUT_DIR): db['PDB_id']
+            for db in paruosti_duomenys
+        }
+
+        for i, future in enumerate(as_completed(ateities_uzduotys)):
+            rez = future.result()
+            pdb_id = rez['PDB_id']
+            status = rez.get('Statusas', '')
+
+            if status == 'OK':
+                print(
+                    f"[{i + 1}/{len(paruosti_duomenys)}] {pdb_id}: OK | "
+                    f"exp_tm={rez.get('Tm_K (Eksp)', 0):.1f} K, "
+                    f"model_tm={rez.get('Tm_K (Modelio)', 0):.1f} K, "
+                    f"model_dg(tm)={rez.get('dG_Tm_eksp (Modelio)', 0):.2f} kcal/mol, "
+                    f"exp_dg(298)={rez.get('dG_kcal (Eksp)', 0):.2f} kcal/mol, "
+                    f"model_dg(298)={rez.get('dG_298K (Modelio)', 0):.2f} kcal/mol"
+                )
+            else:
+                print(f"[{i + 1}/{len(paruosti_duomenys)}] {pdb_id}: {status}")
+
+            rezultatai.append(rez)
+
+    df_rez = pd.DataFrame(rezultatai)
+    df_rez.to_csv(rez_csv_path, index=False)
+
+    valid_dg = df_rez.dropna(subset=['dG_kcal (Eksp)', 'dG_298K (Modelio)'])
+    if len(valid_dg) > 1:
+        kor_coef = np.corrcoef(valid_dg['dG_kcal (Eksp)'], valid_dg['dG_298K (Modelio)'])[0, 1]
+    else:
+        kor_coef = np.nan
+
+    end_time = time.time()
+    print("\n" + "=" * 60)
+    print(f"VISAS SKAIČIAVIMAS BAIGTAS PER {(end_time - start_time):.1f} SEK.")
+    print(f"Visi rezultatai sėkmingai išsaugoti: {rez_csv_path}")
+    if not np.isnan(kor_coef):
+        print(f"Koreliacija (Pearson r) tarp eksp. ir modelio dG (298K): {kor_coef:.3f}")
+    print("=" * 60)

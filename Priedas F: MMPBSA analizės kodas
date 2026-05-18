@@ -1,0 +1,836 @@
+import os
+import glob
+import re
+import subprocess
+import shutil
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sys
+import time
+
+BASE_DIR = os.getcwd()
+OUTPUT_ROOT = os.path.join(BASE_DIR, "saveiku_energija_final")
+OUTPUT_ROOT = os.path.abspath(OUTPUT_ROOT)
+
+CPPTRAJ_INTERVAL = 10
+MMPBSA_INTERVAL = 50
+
+CPPTRAJ_CMD = "cpptraj"
+MMPBSA_CMD = shutil.which("MMPBSA.py")
+if MMPBSA_CMD is None:
+    possible_paths = [
+        "/home/kristupas/miniconda3/envs/amber_env/bin/MMPBSA.py",
+        "/usr/local/bin/MMPBSA.py"
+    ]
+    for p in possible_paths:
+        if os.path.exists(p):
+            MMPBSA_CMD = p
+            break
+
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+def parse_mdout_thermo(mdout_file):
+    data = {'TIME': [], 'TEMP': [], 'Density': [], 'EPtot': [], 'EKtot': [], 'Etot': []}
+    patterns = {
+        'TIME': re.compile(r"TIME\(PS\)\s*=\s*([0-9\.]+)"),
+        'TEMP': re.compile(r"TEMP\(K\)\s*=\s*([0-9\.]+)"),
+        'Density': re.compile(r"Density\s*=\s*([0-9\.]+)"),
+        'EPtot': re.compile(r"EPtot\s*=\s*([0-9\.\-]+)"),
+        'EKtot': re.compile(r"EKtot\s*=\s*([0-9\.\-]+)"),
+        'Etot': re.compile(r"Etot\s*=\s*([0-9\.\-]+)")
+    }
+    try:
+        with open(mdout_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                for key, pattern in patterns.items():
+                    match = pattern.search(line)
+                    if match:
+                        data[key].append(float(match.group(1)))
+        min_len = min(len(v) for v in data.values() if len(v) > 0)
+        if min_len == 0:
+            return pd.DataFrame()
+        return pd.DataFrame({k: v[:min_len] for k, v in data.items() if len(v) > 0})
+    except Exception as e:
+        print(f"    Klaida skaitant {mdout_file}: {e}")
+        return pd.DataFrame()
+
+def run_cpptraj_analysis(solvated_prmtop, trajectory, temp_dir, replica_id, protein_name):
+    rmsd_file = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_rmsd.dat")
+    pca_modes = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_pca_modes.dat")
+    pca_proj = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_pca_proj.dat")
+    stripped_traj = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_stripped.nc")
+    dry_prmtop = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_dry.prmtop")
+    
+    print(f"      Generuojamas RMSD failas: {os.path.basename(rmsd_file)}")
+    print(f"      Generuojamas PCA projekcijos failas: {os.path.basename(pca_proj)}")
+    
+    if not create_dry_topology(solvated_prmtop, dry_prmtop, temp_dir):
+        print(f"      KLAIDA: Nepavyko sukurti dry topologijos")
+        return None, None
+    
+    rel_prmtop = os.path.relpath(solvated_prmtop, temp_dir)
+    rel_traj = os.path.relpath(trajectory, temp_dir)
+    
+    script_strip = f"""parm {rel_prmtop}
+trajin {rel_traj} {CPPTRAJ_INTERVAL}
+strip :WAT,Na+,Cl-
+trajout {os.path.basename(stripped_traj)} netcdf
+run
+quit
+"""
+    script_strip_path = os.path.join(temp_dir, f"cpptraj_strip_R{replica_id}.in")
+    with open(script_strip_path, 'w') as f:
+        f.write(script_strip)
+    
+    result_strip = subprocess.run([CPPTRAJ_CMD, "-i", os.path.basename(script_strip_path)], 
+                                  cwd=temp_dir, 
+                                  capture_output=True,
+                                  text=True)
+    
+    if result_strip.returncode != 0:
+        print(f"      CPPTRAJ strip klaida: {result_strip.stderr[:500]}")
+        return None, None
+    
+    if not os.path.exists(stripped_traj):
+        print(f"      KLAIDA: Stripinta trajektorija nesukurta!")
+        return None, None
+    
+    rel_dry_prmtop = os.path.relpath(dry_prmtop, temp_dir)
+    rel_stripped_traj = os.path.basename(stripped_traj)
+    
+    script_analysis = f"""parm {rel_dry_prmtop}
+trajin {rel_stripped_traj}
+autoimage
+rms ToFirst @CA first out {os.path.basename(rmsd_file)} time 1
+matrix covar name covmat @CA
+run
+analyze matrix covmat vecs 2 out {os.path.basename(pca_modes)}
+run
+projection proj @CA evecs {os.path.basename(pca_modes)} out {os.path.basename(pca_proj)} beg 1 end 2
+run
+quit
+"""
+    script_analysis_path = os.path.join(temp_dir, f"cpptraj_analysis_R{replica_id}.in")
+    with open(script_analysis_path, 'w') as f:
+        f.write(script_analysis)
+    
+    result_analysis = subprocess.run([CPPTRAJ_CMD, "-i", os.path.basename(script_analysis_path)],
+                                     cwd=temp_dir,
+                                     capture_output=True,
+                                     text=True)
+    
+    if result_analysis.returncode != 0:
+        print(f"      CPPTRAJ analizės klaida: {result_analysis.stderr[:500]}")
+        return run_cpptraj_analysis_alt(dry_prmtop, stripped_traj, temp_dir, replica_id, protein_name, rmsd_file, pca_modes, pca_proj)
+    
+    if os.path.exists(rmsd_file):
+        size = os.path.getsize(rmsd_file)
+        print(f"      RMSD failas sukurtas: {size} baitų")
+    else:
+        print(f"      KLAIDA: RMSD failas nesukurtas!")
+        
+    if os.path.exists(pca_proj):
+        size = os.path.getsize(pca_proj)
+        print(f"      PCA projekcijos failas sukurtas: {size} baitų")
+    else:
+        print(f"      KLAIDA: PCA projekcijos failas nesukurtas!")
+    
+    return rmsd_file, pca_proj, stripped_traj, dry_prmtop
+
+def run_cpptraj_analysis_alt(dry_prmtop, stripped_traj, temp_dir, replica_id, protein_name, rmsd_file, pca_modes, pca_proj):
+    print(f"      Bandome alternatyvų PCA metodą...")
+    
+    script_alt = f"""parm {os.path.relpath(dry_prmtop, temp_dir)}
+trajin {os.path.basename(stripped_traj)}
+autoimage
+rms ToFirst @CA first out {os.path.basename(rmsd_file)} time 1
+matrix covar name covmat @CA
+run
+diagmatrix covmat vecs 2 out {os.path.basename(pca_modes)}
+run
+projection proj @CA modes 1,2 out {os.path.basename(pca_proj)}
+run
+quit
+"""
+    script_alt_path = os.path.join(temp_dir, f"cpptraj_alt_R{replica_id}.in")
+    with open(script_alt_path, 'w') as f:
+        f.write(script_alt)
+    
+    result_alt = subprocess.run([CPPTRAJ_CMD, "-i", os.path.basename(script_alt_path)],
+                                cwd=temp_dir,
+                                capture_output=True,
+                                text=True)
+    
+    if result_alt.returncode != 0:
+        print(f"      Alternatyvus metodas taip pat nepavyko: {result_alt.stderr[:200]}")
+        return None, None, None, None
+    
+    return rmsd_file, pca_proj, stripped_traj, dry_prmtop
+    
+def create_dry_topology(solvated_prmtop, dry_prmtop_out, work_dir):
+    try:
+        import parmed as pmd
+        parm = pmd.load_file(solvated_prmtop)
+        parm.strip(':WAT,Na+,Cl-')
+        parm.save(dry_prmtop_out, overwrite=True)
+        return os.path.exists(dry_prmtop_out)
+    except Exception as e:
+        print(f"    parmed klaida: {e}")
+        return False
+
+def parse_mmpbsa_residue_energies(csv_file):
+    try:
+        print(f"    Skaitomas MMPBSA failas: {os.path.basename(csv_file)}")
+        
+        with open(csv_file, 'r') as f:
+            lines = f.readlines()
+        
+        data_lines = lines[8:]
+        
+        energy_sums = {}
+        pair_count = 0
+        
+        for line in data_lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split(',')
+            if len(parts) < 18:  
+                continue
+            
+            try:
+                res1_str = parts[0].strip()
+                res2_str = parts[1].strip()
+                
+                res1_match = re.search(r'(\d+)', res1_str)
+                res2_match = re.search(r'(\d+)', res2_str)
+                
+                if res1_match and res2_match:
+                    res1 = int(res1_match.group(1))
+                    res2 = int(res2_match.group(1))
+                    
+                    try:
+                        total_energy = float(parts[17])
+                        pair_count += 1
+                        
+                        if res1 not in energy_sums:
+                            energy_sums[res1] = 0.0
+                        energy_sums[res1] += total_energy
+                        
+                        if res1 != res2:
+                            if res2 not in energy_sums:
+                                energy_sums[res2] = 0.0
+                            energy_sums[res2] += total_energy
+                            
+                    except (ValueError, TypeError):
+                        continue
+            except:
+                continue
+        
+        print(f"    Apdorota {pair_count} porų")
+        
+        if energy_sums:
+            residues = sorted(energy_sums.keys())
+            energies = [energy_sums[r] for r in residues]
+            
+            df_result = pd.DataFrame({'Residue': residues, 'Energy': energies})
+            
+            print(f"    Išgauta {len(residues)} residuų energijų")
+            print(f"    Energijos diapazonas: {min(energies):.2f} - {max(energies):.2f} kcal/mol")
+            
+            return df_result
+        else:
+            print(f"    KLAIDA: Neišgauta nė vieno resid energijos")
+            return None
+        
+    except Exception as e:
+        print(f"    MMPBSA nuskaitymo klaida: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def run_mmpbsa_decomp(prmtop, trajectory, temp_dir, replica_id, n_res, protein_name):
+    csv_out = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_mmpbsa.csv")
+    stats_out = os.path.join(temp_dir, f"{protein_name}_R{replica_id}_mmpbsa_stats.dat")
+    
+    if os.path.exists(csv_out) and os.path.getsize(csv_out) > 1000:
+        print(f"    MMPBSA rezultatas jau egzistuoja")
+        return csv_out
+    
+    mmpbsa_work_dir = os.path.join(temp_dir, f"mmpbsa_work_R{replica_id}")
+    ensure_dir(mmpbsa_work_dir)
+    
+    shutil.copy2(prmtop, os.path.join(mmpbsa_work_dir, "solvated.prmtop"))
+    
+    if not os.path.exists(os.path.join(mmpbsa_work_dir, "traj.nc")):
+        os.symlink(trajectory, os.path.join(mmpbsa_work_dir, "traj.nc"))
+    
+    proper_dry_prmtop = os.path.join(mmpbsa_work_dir, "dry.prmtop")
+    if not create_dry_topology(prmtop, proper_dry_prmtop, mmpbsa_work_dir):
+        print("    KLAIDA: Nepavyko sukurti dry topologijos")
+        return None
+    
+    mmpbsa_in = os.path.join(mmpbsa_work_dir, "mmpbsa.in")
+    with open(mmpbsa_in, 'w') as f:
+        f.write(f"""&general
+   interval={MMPBSA_INTERVAL}, netcdf=1, verbose=0,
+   keep_files=0,
+/
+&gb
+   igb=5, saltcon=0.150,
+/
+&decomp
+   idecomp=4, dec_verbose=0,
+   print_res="1-{n_res}"
+/
+""")
+    
+    cmd = [
+        MMPBSA_CMD, "-O",
+        "-i", "mmpbsa.in",
+        "-cp", "dry.prmtop",
+        "-y", "traj.nc",
+        "-sp", "solvated.prmtop",
+        "-do", os.path.basename(csv_out),
+        "-o", "mmpbsa_stats.dat"
+    ]
+    
+    print(f"    Paleidžiama MMPBSA ({n_res} residues, idecomp=4)...")
+    
+    try:
+        proc = subprocess.run(cmd, cwd=mmpbsa_work_dir, 
+                             capture_output=True,
+                             text=True, timeout=3600)
+        
+        if proc.returncode != 0:
+            print(f"    MMPBSA klaida: {proc.stderr[-500:]}")
+            with open(os.path.join(temp_dir, f"mmpbsa_error_R{replica_id}.log"), 'w') as f:
+                f.write(proc.stderr)
+            return None
+        
+        src_csv = os.path.join(mmpbsa_work_dir, os.path.basename(csv_out))
+        if os.path.exists(src_csv):
+            shutil.copy2(src_csv, csv_out)
+            size_kb = os.path.getsize(csv_out) / 1024
+            print(f"    MMPBSA baigta: {size_kb:.1f} KB")
+            return csv_out
+        else:
+            print(f"    KLAIDA: MMPBSA nesukūrė CSV failo")
+            return None
+            
+    except subprocess.TimeoutExpired:
+        print("    MMPBSA timeout (1h)")
+    except Exception as e:
+        print(f"    MMPBSA klaida: {e}")
+    
+    return None
+
+def get_residue_count_from_pdb(pdb_file):
+    try:
+        residues = set()
+        with open(pdb_file, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM') and line[17:20].strip() not in ['HOH', 'WAT']:
+                    res_num = line[22:26].strip()
+                    if res_num:
+                        residues.add(int(res_num))
+        return len(residues)
+    except:
+        return 0
+
+def plot_results(protein_name, final_dir, data, n_res):
+    print(f"    Piešiami grafikai...")
+    print(f"    RMSD failų skaičius: {len(data.get('rmsd_files', []))}")
+    print(f"    PCA failų skaičius: {len(data.get('pca_files', []))}")
+    print(f"    Termodinamikos failų skaičius: {len(data.get('thermo_dfs', []))}")
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'MD Simuliacijos Analizė: {protein_name} ({n_res} residuų)', fontsize=16)
+    
+    ax = axes[0, 0]
+    ax.set_title('RMSD (Cα atomai)')
+    ax.set_xlabel('Laikas (ps)')
+    ax.set_ylabel('RMSD (Å)')
+    
+    rmsd_files = data.get('rmsd_files', [])
+    if rmsd_files:
+        for i, rmsd_file in enumerate(rmsd_files):
+            try:
+                print(f"      Skaitomas RMSD failas: {os.path.basename(rmsd_file)}")
+                df = pd.read_csv(rmsd_file, sep=r'\s+', names=['Frame', 'RMSD'], skiprows=1, comment='#')
+                print(f"        RMSD duomenų taškų: {len(df)}")
+                df['Time'] = df['Frame'] * 0.002 * CPPTRAJ_INTERVAL
+                ax.plot(df['Time'], df['RMSD'], label=f'Replika {i+1}', alpha=0.7, linewidth=1)
+            except Exception as e:
+                print(f"        Klaida skaitant RMSD: {e}")
+        ax.legend()
+    else:
+        print(f"      NĖRA RMSD failų!")
+        ax.text(0.5, 0.5, 'Nėra RMSD duomenų', ha='center', va='center', transform=ax.transAxes)
+    ax.grid(alpha=0.3)
+    
+    ax = axes[0, 1]
+    ax.set_title('PCA Projekcija (pirmi 2 komponentai)')
+    ax.set_xlabel('PC1')
+    ax.set_ylabel('PC2')
+    
+    pca_files = data.get('pca_files', [])
+    if pca_files:
+        colors = plt.cm.viridis(np.linspace(0, 1, len(pca_files)))
+        for i, pca_file in enumerate(pca_files):
+            try:
+                print(f"      Skaitomas PCA failas: {os.path.basename(pca_file)}")
+                df = pd.read_csv(pca_file, sep=r'\s+', comment='#')
+                print(f"        PCA duomenų shape: {df.shape}")
+                if df.shape[1] >= 3:
+                    ax.scatter(df.iloc[:, 1], df.iloc[:, 2], 
+                             s=5, alpha=0.5, color=colors[i], label=f'R{i+1}')
+            except Exception as e:
+                print(f"        Klaida skaitant PCA: {e}")
+        ax.legend(markerscale=3)
+    else:
+        print(f"      NĖRA PCA failų!")
+        ax.text(0.5, 0.5, 'Nėra PCA duomenų', ha='center', va='center', transform=ax.transAxes)
+    ax.grid(alpha=0.3)
+    
+    ax = axes[0, 2]
+    ax.set_title('Temperatūra')
+    ax.set_xlabel('Laikas (ps)')
+    ax.set_ylabel('Temperatūra (K)')
+    
+    thermo_dfs = data.get('thermo_dfs', [])
+    if thermo_dfs:
+        for i, df in enumerate(thermo_dfs):
+            if not df.empty and 'TIME' in df and 'TEMP' in df:
+                ax.plot(df['TIME'], df['TEMP'], alpha=0.7, linewidth=1, label=f'R{i+1}')
+        ax.axhline(300, color='red', linestyle='--', alpha=0.5, label='300K')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'Nėra temperatūros duomenų', ha='center', va='center', transform=ax.transAxes)
+    ax.grid(alpha=0.3)
+    
+    ax = axes[1, 0]
+    ax.set_title('Tankis')
+    ax.set_xlabel('Laikas (ps)')
+    ax.set_ylabel('Tankis (g/cm³)')
+    
+    if thermo_dfs:
+        for i, df in enumerate(thermo_dfs):
+            if not df.empty and 'TIME' in df and 'Density' in df:
+                ax.plot(df['TIME'], df['Density'], alpha=0.7, linewidth=1, label=f'R{i+1}')
+        ax.axhline(1.0, color='red', linestyle='--', alpha=0.5, label='1.0 g/cm³')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'Nėra tankio duomenų', ha='center', va='center', transform=ax.transAxes)
+    ax.grid(alpha=0.3)
+    
+    ax = axes[1, 1]
+    ax.set_title('Potencinė Energija')
+    ax.set_xlabel('Laikas (ps)')
+    ax.set_ylabel('EPtot (kcal/mol)')
+    
+    if thermo_dfs:
+        for i, df in enumerate(thermo_dfs):
+            if not df.empty and 'TIME' in df and 'EPtot' in df:
+                ax.plot(df['TIME'], df['EPtot'], alpha=0.7, linewidth=1, label=f'R{i+1}')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'Nėra EPtot duomenų', ha='center', va='center', transform=ax.transAxes)
+    ax.grid(alpha=0.3)
+    
+    ax = axes[1, 2]
+    ax.set_title('Kinetinė Energija')
+    ax.set_xlabel('Laikas (ps)')
+    ax.set_ylabel('EKtot (kcal/mol)')
+    
+    if thermo_dfs:
+        for i, df in enumerate(thermo_dfs):
+            if not df.empty and 'TIME' in df and 'EKtot' in df:
+                ax.plot(df['TIME'], df['EKtot'], alpha=0.7, linewidth=1, label=f'R{i+1}')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'Nėra EKtot duomenų', ha='center', va='center', transform=ax.transAxes)
+    ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(final_dir, f'{protein_name}_full_report.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"    Grafikas išsaugotas: {protein_name}_full_report.png")
+
+def plot_pca_convergence(protein_name, final_dir, pca_files):
+    print(f"    Piešiamas PCA konvergencijos grafikas...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f'{protein_name} - PCA Konvergencija', fontsize=14)
+    
+    colors = plt.cm.viridis(np.linspace(0, 1, len(pca_files)))
+    
+    ax = axes[0]
+    ax.set_title('Pradžia (10%) vs Pabaiga (10%)')
+    ax.set_xlabel('PC1')
+    ax.set_ylabel('PC2')
+    
+    for i, pca_file in enumerate(pca_files):
+        try:
+            df = pd.read_csv(pca_file, sep=r'\s+', comment='#')
+            if df.shape[1] >= 3:
+                n_frames = len(df)
+                n_start = max(1, n_frames // 10) 
+                
+                ax.scatter(df.iloc[:n_start, 1], df.iloc[:n_start, 2], 
+                          s=15, alpha=0.7, color=colors[i], 
+                          label=f'R{i+1} start', marker='o')
+                
+                ax.scatter(df.iloc[-n_start:, 1], df.iloc[-n_start:, 2], 
+                          s=15, alpha=0.7, color=colors[i], 
+                          label=f'R{i+1} end', marker='s')
+        except Exception as e:
+            print(f"      Klaida skaitant PCA failą {i+1}: {e}")
+    
+    ax.legend(fontsize='small', ncol=2)
+    ax.grid(alpha=0.3)
+    
+    ax = axes[1]
+    ax.set_title('Visos replikos')
+    ax.set_xlabel('PC1')
+    ax.set_ylabel('PC2')
+    
+    for i, pca_file in enumerate(pca_files):
+        try:
+            df = pd.read_csv(pca_file, sep=r'\s+', comment='#')
+            if df.shape[1] >= 3:
+                ax.scatter(df.iloc[::10, 1], df.iloc[::10, 2], 
+                          s=5, alpha=0.3, color=colors[i], label=f'R{i+1}')
+        except Exception as e:
+            pass
+    
+    ax.legend(fontsize='small')
+    ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(final_dir, f'{protein_name}_pca_convergence.png'), 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    PCA konvergencijos grafikas išsaugotas")
+
+def save_wsme_energies(protein_name, final_dir, residues, avg_energies, std_energies):
+    output_file = os.path.join(final_dir, f'{protein_name}_WSME_energies.dat')
+    with open(output_file, 'w') as f:
+        f.write(f"# WSME sąveikų energijos - {protein_name}\n")
+        f.write(f"# Sukurta: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# Residų skaičius: {len(residues)}\n")
+        f.write("# Residue    Avg_Energy(kcal/mol)    Std_Dev(kcal/mol)\n")
+        for r, avg, std in zip(residues, avg_energies, std_energies):
+            f.write(f"{r:8d}    {avg:12.4f}    {std:12.4f}\n")
+    
+    print(f"    WSME energijos išsaugotos: {output_file}")
+    
+    plt.figure(figsize=(14, 6))
+    plt.bar(residues, avg_energies, yerr=std_energies, capsize=3, 
+            color='skyblue', edgecolor='navy', alpha=0.7,
+            error_kw={'elinewidth': 1, 'ecolor': 'red'})
+    plt.axhline(0, color='black', linewidth=1, linestyle='-', alpha=0.5)
+    plt.xlabel('Aminorūgšties indeksas')
+    plt.ylabel('Sąveikos energija (kcal/mol)')
+    plt.title(f'{protein_name} - Aminorūgščių sąveikų energijos profilis')
+    plt.grid(axis='y', alpha=0.3, linestyle='--')
+    plt.tight_layout()
+    plt.savefig(os.path.join(final_dir, f'{protein_name}_WSME_energy_profile.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    WSME profilis išsaugotas: {os.path.join(final_dir, f'{protein_name}_WSME_energy_profile.png')}")
+    return output_file
+
+def run_combined_pca(protein_name, final_dir, stripped_trajs, dry_prmtop):
+    print(f"    Vykdoma JUNGTINĖ PCA analizė (visos replikos kartu)...")
+    
+    combined_pca_dir = os.path.join(final_dir, "combined_pca")
+    ensure_dir(combined_pca_dir)
+    
+    rel_prmtop = os.path.relpath(dry_prmtop, combined_pca_dir)
+    
+    cpptraj_in = os.path.join(combined_pca_dir, "combined_pca.in")
+    
+    with open(cpptraj_in, 'w') as f:
+        f.write(f"parm {rel_prmtop}\n")
+        
+        for traj in stripped_trajs:
+            rel_traj = os.path.relpath(traj, combined_pca_dir)
+            f.write(f"trajin {rel_traj}\n")
+            
+        f.write(f"""
+autoimage
+rms FitToFirst @CA first
+
+matrix covar name combined_covar @CA
+run
+
+runanalysis diagmatrix combined_covar vecs 2 out pca_modes.dat
+quit
+""")
+    print("      Skaičiuojamos PCA modos...")
+    result = subprocess.run([CPPTRAJ_CMD, "-i", "combined_pca.in"], 
+                           cwd=combined_pca_dir, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"    Jungtinės PCA klaida (Modes): {result.stderr[:200]}")
+        return None
+
+    cpptraj_proj = os.path.join(combined_pca_dir, "combined_pca_proj.in")
+    with open(cpptraj_proj, 'w') as f:
+        f.write(f"parm {rel_prmtop}\n")
+        
+        for traj in stripped_trajs:
+            rel_traj = os.path.relpath(traj, combined_pca_dir)
+            f.write(f"trajin {rel_traj}\n")
+            
+        f.write(f"""
+autoimage
+rms FitToFirst @CA first
+
+projection proj_all evecs pca_modes.dat out combined_pca_proj.dat beg 1 end 2 @CA
+run
+quit
+""")
+    
+    print("      Vykdoma projekcija...")
+    result_proj = subprocess.run([CPPTRAJ_CMD, "-i", "combined_pca_proj.in"], 
+                                cwd=combined_pca_dir, capture_output=True, text=True)
+    
+    if result_proj.returncode != 0:
+        print(f"    Jungtinės PCA klaida (Projection): {result_proj.stderr[:200]}")
+        return None
+
+
+    full_data_path = os.path.join(combined_pca_dir, "combined_pca_proj.dat")
+    if os.path.exists(full_data_path):
+        return full_data_path
+    return None
+
+def plot_combined_pca(protein_name, final_dir, combined_data_file, n_replicas):
+    if not combined_data_file: return
+
+    try:
+        df = pd.read_csv(combined_data_file, sep=r'\s+', comment='#')
+        
+        total_frames = len(df)
+        frames_per_replica = total_frames // n_replicas
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        colors = plt.cm.viridis(np.linspace(0, 1, n_replicas))
+        
+        for i in range(n_replicas):
+            start_idx = i * frames_per_replica
+            end_idx = (i + 1) * frames_per_replica
+            
+            subset = df.iloc[start_idx:end_idx]
+            
+            ax.scatter(subset.iloc[::10, 1], subset.iloc[::10, 2], 
+                      s=10, alpha=0.6, color=colors[i], label=f'Replika {i+1}')
+            
+            if not subset.empty:
+                ax.scatter(subset.iloc[0, 1], subset.iloc[0, 2], s=100, marker='^', 
+                          edgecolor='black', color=colors[i], zorder=10)
+                ax.scatter(subset.iloc[-1, 1], subset.iloc[-1, 2], s=100, marker='s', 
+                          edgecolor='black', color=colors[i], zorder=10)
+
+        ax.set_title(f'{protein_name} - Jungtinė PCA (Teisingas palyginimas)')
+        ax.set_xlabel('PC1 (Bendras judesys)')
+        ax.set_ylabel('PC2 (Bendras judesys)')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        
+        out_file = os.path.join(final_dir, f'{protein_name}_COMBINED_PCA.png')
+        plt.savefig(out_file, dpi=150, bbox_inches='tight')
+        print(f"    Jungtinis PCA grafikas išsaugotas: {os.path.basename(out_file)}")
+        plt.close()
+            
+    except Exception as e:
+        print(f"    Klaida piešiant jungtinį PCA: {e}")
+
+def process_protein(protein_name, simulation_dirs):
+    print(f"\n{'='*50}")
+    print(f" ANALIZUOJAMAS: {protein_name}")
+    print(f"{'='*50}")
+    
+    final_dir = os.path.join(OUTPUT_ROOT, protein_name)
+    temp_dir = os.path.join(final_dir, "tarpiniai_failai")
+    ensure_dir(final_dir)
+    ensure_dir(temp_dir)
+    
+    data = {
+        'thermo_dfs': [],
+        'rmsd_files': [],
+        'pca_files': [],
+        'mmpbsa_energies': [],
+        'stripped_trajs': [],
+        'dry_prmtop': None
+    }
+    
+    n_res_detected = 0
+    
+    for i, sim_dir in enumerate(simulation_dirs):
+        replica_id = i + 1
+        sim_work_dir = os.path.join(sim_dir, protein_name)
+        
+        if not os.path.isdir(sim_work_dir):
+            continue
+        
+        print(f"\n  Replika {replica_id}:")
+        
+        prmtop = os.path.join(sim_work_dir, f"{protein_name}_solvated.prmtop")
+        mdcrd = os.path.join(sim_work_dir, "prod.mdcrd")
+        mdout = os.path.join(sim_work_dir, "prod.out")
+        protonated_pdb = os.path.join(sim_work_dir, f"{protein_name}_protonated.pdb")
+        
+        if not os.path.exists(prmtop) or not os.path.exists(mdcrd):
+            print(f"    Trūksta failų! Praleidžiama.")
+            continue
+        
+        if n_res_detected == 0 and os.path.exists(protonated_pdb):
+            n_res_detected = get_residue_count_from_pdb(protonated_pdb)
+            print(f"    Iš PDB nustatyta residuų: {n_res_detected}")
+        
+        if os.path.exists(mdout):
+            df_thermo = parse_mdout_thermo(mdout)
+            if not df_thermo.empty:
+                data['thermo_dfs'].append(df_thermo)
+                print(f"    Termodinamika: {len(df_thermo)} taškų")
+        
+        rmsd_file, pca_file, stripped_traj, dry_top = run_cpptraj_analysis(
+            prmtop, mdcrd, temp_dir, replica_id, protein_name
+        )
+        
+        if rmsd_file and os.path.exists(rmsd_file):
+            data['rmsd_files'].append(rmsd_file)
+            print(f"    RMSD: OK - {os.path.basename(rmsd_file)}")
+        else:
+            print(f"    KLAIDA: RMSD failas neegzistuoja!")
+        
+        if pca_file and os.path.exists(pca_file):
+            data['pca_files'].append(pca_file)
+            print(f"    PCA: OK - {os.path.basename(pca_file)}")
+        else:
+            print(f"    KLAIDA: PCA failas neegzistuoja!")
+        
+        if stripped_traj and os.path.exists(stripped_traj):
+            data['stripped_trajs'].append(stripped_traj)
+        
+        if dry_top and os.path.exists(dry_top) and data['dry_prmtop'] is None:
+            data['dry_prmtop'] = dry_top
+        
+        if n_res_detected > 0 and n_res_detected < 1000 and MMPBSA_CMD:
+            csv_file = run_mmpbsa_decomp(
+                prmtop, mdcrd, temp_dir, replica_id, n_res_detected, protein_name
+            )
+            if csv_file:
+                df_energies = parse_mmpbsa_residue_energies(csv_file)
+                if df_energies is not None and len(df_energies) > 0:
+                    data['mmpbsa_energies'].append(df_energies)
+                    print(f"    MMPBSA: {len(df_energies)} residues")
+    
+    if not data['thermo_dfs'] and not data['rmsd_files']:
+        print(f"\n  [!] Nėra duomenų {protein_name}")
+        return
+    
+    print(f"\n  Generuojami grafikai...")
+    plot_results(protein_name, final_dir, data, n_res_detected)
+    
+    if data['pca_files']:
+        plot_pca_convergence(protein_name, final_dir, data['pca_files'])
+    
+    if data['mmpbsa_energies']:
+        print(f"\n  Apdorojamos MMPBSA energijos ({len(data['mmpbsa_energies'])} replikos)...")
+        all_residues = set()
+        for df in data['mmpbsa_energies']:
+            all_residues.update(df['Residue'].values)
+        
+        common_residues = sorted(all_residues)
+        print(f"    Bendri residai ({len(common_residues)}): {common_residues[:10]}...")
+        
+        if len(common_residues) > 0:
+            energy_matrix = []
+            for df in data['mmpbsa_energies']:
+                en_dict = dict(zip(df['Residue'], df['Energy']))
+                energies = [en_dict.get(res, np.nan) for res in common_residues]
+                energy_matrix.append(energies)
+            
+            energy_matrix = np.array(energy_matrix)
+            avg_energies = np.nanmean(energy_matrix, axis=0)
+            std_energies = np.nanstd(energy_matrix, axis=0)
+            
+            save_wsme_energies(protein_name, final_dir, common_residues, avg_energies, std_energies)
+    else:
+        print(f"\n  [!] Nėra MMPBSA energijų duomenų WSME profiliui!")
+        
+    if len(data['stripped_trajs']) > 1 and data['dry_prmtop']:
+        combined_pca_file = run_combined_pca(protein_name, final_dir, 
+                                           data['stripped_trajs'], data['dry_prmtop'])
+        if combined_pca_file:
+            plot_combined_pca(protein_name, final_dir, combined_pca_file, len(data['stripped_trajs']))
+    
+    print(f"\n   {protein_name} analizė baigta!")
+    print(f"  Rezultatai: {final_dir}")
+
+def main():
+    print("="*70)
+    print(" MD SIMULIACIJŲ ANALIZĖS SKRIPTAS (VEIKIANTI VERSIJA)")
+    print("="*70)
+    
+    sim_dirs = sorted(glob.glob(os.path.join(BASE_DIR, "amber_simulations_output_*")))
+    if not sim_dirs:
+        print("Klaida: Nerasta amber_simulations_output_* direktorijų!")
+        return
+    
+    print(f"Rastos simuliacijų direktorijos ({len(sim_dirs)}):")
+    for d in sim_dirs:
+        print(f"  - {os.path.basename(d)}")
+    
+    proteins = []
+    for d in sim_dirs:
+        for item in os.listdir(d):
+            item_path = os.path.join(d, item)
+            if os.path.isdir(item_path):
+                if os.path.exists(os.path.join(item_path, f"{item}_solvated.prmtop")) and \
+                   os.path.exists(os.path.join(item_path, "prod.mdcrd")):
+                    if item not in proteins:
+                        proteins.append(item)
+    
+    proteins.sort()
+    print(f"\nRasti baltymai ({len(proteins)}):")
+    for i, p in enumerate(proteins[:20]):
+        print(f"  {i+1:2d}. {p}")
+    if len(proteins) > 20:
+        print(f"  ... ir dar {len(proteins)-20}")
+    
+    print(f"\nIšvesties direktorija: {OUTPUT_ROOT}")
+    print("="*70)
+    
+    print(f"\nPradedama visų {len(proteins)} baltymų analizė...")
+    
+    for prot in proteins:
+        print(f"\n{'='*50}")
+        print(f" Pradedamas: {prot}")
+        print(f"{'='*50}")
+        try:
+            process_protein(prot, sim_dirs)
+        except KeyboardInterrupt:
+            print("\n\nAnalizė nutraukta vartotojo!")
+            break
+        except Exception as e:
+            print(f"\nKlaida apdorojant {prot}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    print("\n" + "="*70)
+    print(" VISI DARBAI BAIGTI!")
+    print(f" Rezultatai: {OUTPUT_ROOT}")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()

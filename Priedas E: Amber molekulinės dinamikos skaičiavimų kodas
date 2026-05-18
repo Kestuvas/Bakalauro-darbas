@@ -1,0 +1,310 @@
+import os
+import subprocess
+import glob
+import datetime
+import re
+import shutil
+import time
+import sys
+import multiprocessing
+
+MAIN_OUTPUT_DIR = f"amber_simulations_output_{datetime.date.today().strftime('%Y-%m-%d')}"
+TARGET_PH = 7.4
+IONIC_STRENGTH = 0.150
+FORCE_FIELD = "leaprc.protein.ff19SB"
+WATER_MODEL = "tip3p"
+WATER_BOX_TYPE = "TIP3PBOX"
+BOX_BUFFER = 12.0
+
+AVAILABLE_GPUS = [0, 1]
+
+MIN_IN = """
+Minimization
+ &cntrl
+  imin=1, maxcyc=5000, ncyc=2500, ntb=1, cut=10.0, ntr=1,
+  restraintmask='!@H=', restraint_wt=10.0,
+ /
+"""
+HEAT_IN = """
+Heating (NVT)
+ &cntrl
+  imin=0, ntx=1, irest=0, nstlim=100000, dt=0.002, ntc=2, ntf=2, ntb=1, cut=10.0,
+  ntt=3, gamma_ln=1.0, tempi=0, temp0=300.0, ig=-1,
+  ntpr=2000, ntwx=2000, ntwr=10000, ntr=1, restraintmask='!@H=', restraint_wt=10.0,
+ /
+"""
+DENSITY_IN = """
+Density equilibration (NPT)
+ &cntrl
+  imin=0, ntx=5, irest=1, nstlim=50000, dt=0.002, ntc=2, ntf=2, ntb=2, ntp=1, taup=2.0, cut=10.0,
+  ntt=3, gamma_ln=1.0, temp0=300.0, ig=-1,
+  ntpr=1000, ntwx=1000, ntwr=500,
+ /
+"""
+EQUIL_IN = """
+Final equilibration (NPT)
+ &cntrl
+  imin=0, ntx=5, irest=1, nstlim=250000, dt=0.002, ntc=2, ntf=2, ntb=2, ntp=1, taup=2.0, cut=10.0,
+  ntt=3, gamma_ln=1.0, temp0=300.0, ig=-1,
+  ntpr=5000, ntwx=5000, ntwr=10000,
+ /
+"""
+PROD_IN = """
+Production run (NPT)
+ &cntrl
+  imin=0, ntx=5, irest=1, nstlim=10000000, dt=0.002, ntc=2, ntf=2, ntb=2, ntp=1, taup=2.0, cut=10.0,
+  ntt=3, gamma_ln=1.0, temp0=300.0, ig=-1,
+  ntpr=5000, ntwx=5000, ntwr=10000,
+ /
+"""
+
+def handle_error(program_name, log_file):
+    error_msg = f"Program '{program_name}' failed"
+    sys.stderr.write(f"\n!!! KRITINĖ KLAIDA ({program_name}): Žr. {log_file}\n")
+    raise RuntimeError(error_msg)
+
+def run_command(command, log_file=None, input=None):
+    try:
+        process = subprocess.run(
+            command, 
+            shell=True, 
+            check=False, 
+            capture_output=True, 
+            text=True, 
+            input=input
+        )
+        if log_file:
+            with open(log_file, 'w') as f:
+                f.write(f"--- COMMAND ---\n{command}\n\n")
+                if input:
+                    f.write(f"--- STDIN ---\n{input}\n\n")
+                f.write(f"--- STDOUT ---\n{process.stdout}\n\n")
+                f.write(f"--- STDERR ---\n{process.stderr}\n\n")
+
+        if process.returncode != 0:
+            return False
+        return True
+    except KeyboardInterrupt:
+        sys.exit(1)
+
+def write_input_files():
+    files = { "min.in": MIN_IN, "heat.in": HEAT_IN, "density.in": DENSITY_IN, "equil.in": EQUIL_IN, "prod.in": PROD_IN }
+    for filename, content in files.items():
+        with open(filename, 'w') as f:
+            f.write(content)
+
+def cleanup_input_files():
+    for f in ["min.in", "heat.in", "density.in", "equil.in", "prod.in"]:
+        if os.path.exists(f):
+            os.remove(f)
+
+def process_single_protein(pdb_file_original, gpu_id):
+    
+    clean_basename = re.sub(r'[^a-zA-Z0-9_-]', '', os.path.splitext(pdb_file_original)[0])
+    sim_dir = os.path.join(MAIN_OUTPUT_DIR, clean_basename)
+    
+    log_prefix = f"[GPU-{gpu_id} | {clean_basename}]"
+
+    print(f"{log_prefix} Pradedamas darbas...")
+    os.makedirs(sim_dir, exist_ok=True)
+    
+    try:
+        pka_file = os.path.join(sim_dir, f"{clean_basename}.pka")
+        if not os.path.exists(pka_file) or os.path.getsize(pka_file) == 0:
+            print(f"{log_prefix} Vykdoma PROPKA...")
+            process = subprocess.run(
+                f"propka3 {pdb_file_original} --pH {TARGET_PH}",
+                shell=True, capture_output=True, text=True
+            )
+            if process.returncode != 0 and not os.path.exists(pka_file):
+                 handle_error("propka3", pka_file)
+            with open(pka_file, 'w') as f: f.write(process.stdout)
+
+        pdb_protonated = os.path.join(sim_dir, f"{clean_basename}_protonated.pdb")
+        if not os.path.exists(pdb_protonated):
+            run_command(f"cp {pdb_file_original} {pdb_protonated}")
+            with open(pka_file, 'r') as f:
+                pka_content = f.read()
+            for line in pka_content.splitlines():
+                if "ATOM" in line and any(res in line for res in ["HIS", "ASP", "GLU", "CYS", "LYS"]):
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        res_num, chain_id, new_res_name = parts[5], parts[4], parts[3]
+                        sed_command = f"sed -i -E \"s/^(ATOM\\s+.{{10}})(HIS|ASP|GLU|CYS|LYS)(\\s+{chain_id}\\s*{res_num}\\s+)/\\1{new_res_name}\\3/\" \"{pdb_protonated}\""
+                        subprocess.run(sed_command, shell=True, check=True)
+
+        prmtop = os.path.join(sim_dir, f"{clean_basename}_solvated.prmtop")
+        inpcrd = os.path.join(sim_dir, f"{clean_basename}_solvated.inpcrd")
+        
+        if not os.path.exists(prmtop):
+            print(f"{log_prefix} TLEAP skaičiavimai...")
+            tleap_log_wet = os.path.join(sim_dir, "tleap_wet_run.log")
+            tleap_in_wet = f"""
+source {FORCE_FIELD}
+source leaprc.water.{WATER_MODEL}
+mol = loadpdb "{pdb_protonated}"
+solvatebox mol {WATER_BOX_TYPE} {BOX_BUFFER}
+check mol
+quit
+"""
+            if not run_command(f"tleap -f -", log_file=tleap_log_wet, input=tleap_in_wet):
+                handle_error("tleap (wet run)", tleap_log_wet)
+
+            num_waters = 0
+            charge = 0.0
+            with open(tleap_log_wet, 'r') as f:
+                log_content = f.read()
+                waters_match = re.search(r'Added (\d+) residues', log_content)
+                if waters_match: num_waters = int(waters_match.group(1))
+                charge_match = re.search(r'Total unperturbed charge:.*?([\-|\+]?\d+\.\d+)', log_content)
+                if not charge_match: charge_match = re.search(r'unperturbed charge of the unit \((.*?)\)', log_content)
+                if charge_match: charge = float(charge_match.group(1))
+            
+            if num_waters == 0:
+                handle_error("Ion Calculation (no waters)", tleap_log_wet)
+
+            num_ion_pairs = round(num_waters * (IONIC_STRENGTH / 55.5))
+            charge_to_neutralize = -round(charge)
+            num_na, num_cl = num_ion_pairs, num_ion_pairs
+            if charge_to_neutralize > 0: num_na += charge_to_neutralize
+            elif charge_to_neutralize < 0: num_cl += abs(charge_to_neutralize)
+
+            tleap_log_final = os.path.join(sim_dir, "tleap.log")
+            tleap_in_final = f"""
+source {FORCE_FIELD}
+source leaprc.water.{WATER_MODEL}
+mol = loadpdb "{pdb_protonated}"
+set default PBRadii mbondi2
+solvatebox mol {WATER_BOX_TYPE} {BOX_BUFFER}
+addions mol Na+ {num_na}
+addions mol Cl- {num_cl}
+saveamberparm mol "{prmtop}" "{inpcrd}"
+quit
+"""
+            if not run_command(f"tleap -f -", log_file=tleap_log_final, input=tleap_in_final):
+                handle_error("tleap (final run)", tleap_log_final)
+
+        dry_prmtop = os.path.join(sim_dir, f'{clean_basename}_dry.prmtop')
+        if not os.path.exists(dry_prmtop):
+            cpptraj_log_file = os.path.join(sim_dir, "cpptraj_strip.log")
+            cpptraj_script = f"""
+parm "{prmtop}"
+strip :WAT,Na+,Cl-
+parmwrite out "{dry_prmtop}"
+go
+"""
+            if not run_command(f"cpptraj", log_file=cpptraj_log_file, input=cpptraj_script):
+                handle_error("cpptraj", cpptraj_log_file)
+
+        print(f"{log_prefix} Pradedami AMBER MD etapai...")
+        
+        md_steps = {
+            "Minimizavimas": ("min", inpcrd),
+            "Kaitinimas": ("heat", os.path.join(sim_dir, "min.rst")),
+            "Tankio ekvilibracija": ("density", os.path.join(sim_dir, "heat.rst")),
+            "Galutinė ekvilibracija": ("equil", os.path.join(sim_dir, "density.rst")),
+            "Produkcijos simuliacija": ("prod", os.path.join(sim_dir, "equil.rst")),
+        }
+        
+        step_count = 1
+        for step_name, (in_prefix, prev_rst) in md_steps.items():
+            final_rst = os.path.join(sim_dir, f"{in_prefix}.rst")
+            if os.path.exists(final_rst) and os.path.getsize(final_rst) > 0:
+                print(f"{log_prefix} Praleidžiamas {step_name} (failas jau yra).")
+                step_count += 1
+                continue
+
+            print(f"{log_prefix} Vykdoma: {step_name} ({step_count}/5)")
+            
+            in_file = f"{in_prefix}.in" 
+            out_file = os.path.join(sim_dir, f"{in_prefix}.out")
+            mdcrd_file = os.path.join(sim_dir, f"{in_prefix}.mdcrd") if step_name != "Minimizavimas" else ""
+            
+            max_retries = 10
+            current_input_rst = prev_rst
+            current_output_rst = final_rst
+            success = False
+            
+            for attempt in range(max_retries):
+                cmd = f"pmemd.cuda -O -i {in_file} -p {prmtop} -c {current_input_rst} -o {out_file} -r {current_output_rst}"
+                if mdcrd_file:
+                    cmd += f" -x {mdcrd_file}"
+                if step_name in ["Minimizavimas", "Kaitinimas"]:
+                    cmd += f" -ref {current_input_rst}"
+
+                if run_command(cmd):
+                    success = True
+                    break 
+                else:
+                    print(f"{log_prefix} !!! ĮSPĖJIMAS: {step_name} nepavyko (bandymas {attempt+1}).")
+                    time.sleep(2)
+                    
+                    if os.path.exists(current_output_rst) and os.path.getsize(current_output_rst) > 0:
+                        print(f"{log_prefix} -> Rastas restart failas. Tęsiamas darbas.")
+                        rescue_rst = os.path.join(sim_dir, f"{in_prefix}_rescue_{attempt}.rst")
+                        shutil.copy(current_output_rst, rescue_rst)
+                        current_input_rst = rescue_rst
+                    else:
+                        print(f"{log_prefix} -> Restart failas nerastas. Kartojama.")
+
+                    if os.path.exists(out_file):
+                        shutil.move(out_file, out_file + f".fail{attempt}")
+
+            if not success:
+                handle_error(f"pmemd.cuda ({step_name})", out_file + f".fail{max_retries-1}")
+            
+            step_count += 1
+    
+    except Exception as e:
+        print(f"{log_prefix} KLAIDA: {e}")
+        return
+
+    print(f"{log_prefix} Baltybas {pdb_file_original} sėkmingai baigtas!")
+
+def gpu_worker(gpu_id, file_queue):
+    
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    print(f"--- Paleistas darbininkas ant GPU {gpu_id} (PID: {os.getpid()}) ---")
+    
+    while True:
+        try:
+            pdb_file = file_queue.get(timeout=3) 
+            process_single_protein(pdb_file, gpu_id)
+        except multiprocessing.queues.Empty:
+            print(f"--- Darbininkas ant GPU {gpu_id} baigė darbą (eilė tuščia) ---")
+            break
+        except Exception as e:
+            print(f"--- Darbininkas ant GPU {gpu_id} susidūrė su kritine klaida: {e}")
+            break
+
+def main():
+    write_input_files()
+    os.makedirs(MAIN_OUTPUT_DIR, exist_ok=True)
+
+    pdb_files = glob.glob("*.pdb")
+    if not pdb_files:
+        print("Nerasta .pdb failų.")
+        return
+
+    print(f"Rasta failų: {len(pdb_files)}. Pradedamas lygiagretus apdorojimas ant {len(AVAILABLE_GPUS)} GPU.")
+
+    queue = multiprocessing.Queue()
+    for f in pdb_files:
+        queue.put(f)
+    processes = []
+    for gpu_id in AVAILABLE_GPUS:
+        p = multiprocessing.Process(target=gpu_worker, args=(gpu_id, queue))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    cleanup_input_files()
+    print("==================================================")
+    print(f"Visi darbai baigti. Rezultatai: {MAIN_OUTPUT_DIR}")
+    print("==================================================")
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support() 
+    main()

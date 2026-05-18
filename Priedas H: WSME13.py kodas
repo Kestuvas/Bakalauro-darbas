@@ -1,0 +1,850 @@
+import os
+import sys
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import root_scalar, minimize, differential_evolution
+from Bio.PDB import PDBParser
+from Bio.PDB.SASA import ShrakeRupley
+from Bio import BiopythonWarning
+import glob
+import pandas as pd
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import warnings
+import re
+from collections import defaultdict
+from scipy.stats import trim_mean, pearsonr
+from numba import njit
+
+amino_acid_to_number = {
+    "A": 0, "C": 1, "D": 2, "E": 3, "F": 4,
+    "G": 5, "H": 6, "I": 7, "K": 8, "L": 9,
+    "M": 10, "N": 11, "P": 12, "Q": 13, "R": 14,
+    "S": 15, "T": 16, "V": 17, "W": 18, "Y": 19,
+}
+
+warnings.simplefilter('ignore', BiopythonWarning)
+
+@njit(cache=True)
+def calc_segments_numba(n, epsilon_matrica, s_masyvas):
+    E_kontaktu = np.zeros((n, n), dtype=np.float64)
+    S_suma = np.zeros((n, n), dtype=np.float64)
+    prefix_s = np.zeros(n + 1, dtype=np.float64)
+    for i in range(n):
+        prefix_s[i+1] = prefix_s[i] + s_masyvas[i]
+    for i in range(n):
+        for j in range(i, n):
+            sm = 0.0
+            for x in range(i, j+1):
+                for y in range(x+1, j+1):
+                    sm += epsilon_matrica[x, y]
+            E_kontaktu[i, j] = sm
+            S_suma[i, j] = prefix_s[j + 1] - prefix_s[i]
+    return E_kontaktu, S_suma
+
+@njit(cache=True)
+def calc_profile_numba(n, T, R, E_kontaktu, S_suma):
+    beta = 1.0 / (R * T)
+    log_Z_U = np.full((n + 1, n + 1), -np.inf, dtype=np.float64)
+    log_Z_F = np.full((n + 1, n + 1), -np.inf, dtype=np.float64)
+    log_Z_U[0, 0] = 0.0
+    for k in range(1, n + 1):
+        for n_aa in range(k):
+            log_Z_U[k, n_aa] = np.logaddexp(log_Z_U[k - 1, n_aa], log_Z_F[k - 1, n_aa])
+        for i in range(k):
+            n_aa_segmente = k - i
+            dg = E_kontaktu[i, k - 1] - T * S_suma[i, k - 1]
+            terminas_bendras = -beta * dg
+            for n_aa_iki in range(i + 1):
+                val_U = log_Z_U[i, n_aa_iki]
+                if val_U > -np.inf:
+                    n_aa_viso = n_aa_iki + n_aa_segmente
+                    terminas = val_U + terminas_bendras
+                    log_Z_F[k, n_aa_viso] = np.logaddexp(log_Z_F[k, n_aa_viso], terminas)
+    logZ_profilis = np.full(n + 1, -np.inf, dtype=np.float64)
+    for n_aa in range(n + 1):
+        logZ_profilis[n_aa] = np.logaddexp(log_Z_U[n, n_aa], log_Z_F[n, n_aa])
+    F_profilis = np.full(n + 1, np.inf, dtype=np.float64)
+    for i in range(n + 1):
+        if logZ_profilis[i] > -np.inf:
+            F_profilis[i] = -R * T * logZ_profilis[i]
+    return F_profilis
+
+def gauti_sasa_ir_struktura(pdb_kelias, n_mmpbsa, atstumo_riba=8.0):
+    parser = PDBParser(QUIET=True)
+    try:
+        struktura = parser.get_structure('baltymas', pdb_kelias)
+    except Exception as e:
+        raise ValueError(f"Nepavyko nuskaityti PDB failo: {e}")
+
+    sr = ShrakeRupley()
+    sr.compute(struktura, level="R")
+
+    modelis = list(struktura.get_models())[0]
+    grandine = list(modelis.get_chains())[0]
+    
+    visi_residues = [res for res in grandine.get_residues() if res.get_id()[0] == ' ']
+    if visi_residues:
+        offset = visi_residues[0].get_id()[1]
+    else:
+        offset = 1
+        
+    residues = []
+    for res in visi_residues:
+        idx = res.get_id()[1] - offset
+        if 0 <= idx < n_mmpbsa:
+            residues.append((idx, res))
+
+    n = n_mmpbsa
+    kontaktu_matrica = np.zeros((n_mmpbsa, n_mmpbsa))
+    cys_pairs = []
+    seka = ['X'] * n
+    sasa_masyvas = np.zeros(n)
+
+    THREE_TO_ONE = {
+        'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
+        'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+        'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
+        'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
+    }
+
+    for idx_i, res_i in residues:
+        aa_char = THREE_TO_ONE.get(res_i.get_resname().upper(), 'X')
+        seka[idx_i] = aa_char
+        sasa_masyvas[idx_i] = res_i.sasa if hasattr(res_i, 'sasa') else 0.0
+
+        for idx_j, res_j in residues:
+            if idx_j >= idx_i:
+                if 'CA' in res_i and 'CA' in res_j:
+                    if (res_i['CA'] - res_j['CA']) <= atstumo_riba:
+                        kontaktu_matrica[idx_i, idx_j] = 1
+                        kontaktu_matrica[idx_j, idx_i] = 1
+
+                if res_i.get_resname() == 'CYS' and res_j.get_resname() == 'CYS':
+                    if 'SG' in res_i and 'SG' in res_j:
+                        if (res_i['SG'] - res_j['SG']) <= 3.0:
+                            if idx_i != idx_j and (idx_i, idx_j) not in cys_pairs:
+                                cys_pairs.append((idx_i, idx_j))
+
+    MAX_SASA_AA = {
+        'A': 129.0, 'R': 274.0, 'N': 195.0, 'D': 193.0, 'C': 167.0,
+        'Q': 225.0, 'E': 223.0, 'G': 104.0, 'H': 224.0, 'I': 197.0,
+        'L': 201.0, 'K': 236.0, 'M': 224.0, 'F': 240.0, 'P': 159.0,
+        'S': 155.0, 'T': 172.0, 'W': 285.0, 'Y': 263.0, 'V': 174.0
+    }
+
+    for idx_i, res_i in residues:
+        aa_char = seka[idx_i]
+        max_sasa = MAX_SASA_AA.get(aa_char, 200.0)
+        if max_sasa > 0:
+            sasa_masyvas[idx_i] = min(sasa_masyvas[idx_i] / max_sasa, 1.0)
+
+    return kontaktu_matrica, cys_pairs, seka, sasa_masyvas
+
+def nuskaityti_mmpbsa_padalinta(katalogas, failu_sablonas):
+    failu_keliai = glob.glob(os.path.join(katalogas, failu_sablonas))
+    if not failu_keliai:
+        raise FileNotFoundError(
+            f"Nerasta MMPBSA MDOUT failų: {os.path.join(katalogas, failu_sablonas)}"
+        )
+
+    vdw_dict = defaultdict(list)
+    elec_dict = defaultdict(list)
+    pol_dict = defaultdict(list)
+    npol_dict = defaultdict(list)
+    max_idx = 0
+
+    for failas in failu_keliai:
+        frames_vdw = defaultdict(list)
+        frames_elec = defaultdict(list)
+        frames_pol = defaultdict(list)
+        frames_npol = defaultdict(list)
+
+        with open(failas, 'r') as f:
+            for line in f:
+                if line.startswith("TDC "):
+                    parts = line.split()
+                    if len(parts) >= 8:
+                        try:
+                            r1 = int(parts[1].replace('->', '')) - 1
+                            r2 = int(parts[2]) - 1
+
+                            if r1 < r2:
+                                val_vdw = float(parts[4])
+                                val_elec = float(parts[5])
+                                val_pol = float(parts[6])
+                                val_npol = float(parts[7])
+                                
+                                if not (np.isnan(val_vdw) or np.isinf(val_vdw)):
+                                    rk = (r1, r2)
+                                    frames_vdw[rk].append(val_vdw)
+                                    frames_elec[rk].append(val_elec)
+                                    frames_pol[rk].append(val_pol)
+                                    frames_npol[rk].append(val_npol)
+
+                            max_idx = max(max_idx, r1, r2)
+                        except:
+                            pass
+
+        for rk, vals in frames_vdw.items():
+            if len(vals) > 0:
+                vdw_dict[rk].append(np.nanmedian(vals))
+                elec_dict[rk].append(np.nanmedian(frames_elec[rk]))
+                pol_dict[rk].append(np.nanmedian(frames_pol[rk]))
+                npol_dict[rk].append(np.nanmedian(frames_npol[rk]))
+
+    n = max_idx + 1
+    vdw_matrica = np.zeros((n, n))
+    elec_matrica = np.zeros((n, n))
+    pol_matrica = np.zeros((n, n))
+    npol_matrica = np.zeros((n, n))
+
+    for (i, j), vals in vdw_dict.items():
+        vdw_matrica[i, j] = np.nanmedian(vals)
+        elec_matrica[i, j] = np.nanmedian(elec_dict[(i, j)])
+        pol_matrica[i, j] = np.nanmedian(pol_dict[(i, j)])
+        npol_matrica[i, j] = np.nanmedian(npol_dict[(i, j)])
+
+    vdw_matrica  = vdw_matrica + vdw_matrica.T
+    elec_matrica = elec_matrica + elec_matrica.T
+    pol_matrica  = pol_matrica + pol_matrica.T
+    npol_matrica = npol_matrica + npol_matrica.T
+
+    np.fill_diagonal(vdw_matrica, 0)
+    np.fill_diagonal(elec_matrica, 0)
+    np.fill_diagonal(pol_matrica, 0)
+    np.fill_diagonal(npol_matrica, 0)
+
+    return vdw_matrica, elec_matrica, pol_matrica, npol_matrica, n
+
+def parse_energy(val_str):
+    if pd.isna(val_str):
+        return np.nan
+    val_str = str(val_str).lower().replace(',', '.')
+    match = re.search(r'[-+]?\d*\.?\d+', val_str)
+    if not match:
+        return np.nan
+    val = float(match.group())
+    if 'kj' in val_str:
+        val /= 4.184
+    return val
+
+@njit(cache=True)
+def _generuoti_Fn_profili_numba(E_kontaktu, S_suma, R, T):
+    beta = 1.0 / (R * T)
+    n = E_kontaktu.shape[0]
+    log_Z_U = np.full((n + 1, n + 1), -np.inf, dtype=np.float64)
+    log_Z_F = np.full((n + 1, n + 1), -np.inf, dtype=np.float64)
+    log_Z_U[0, 0] = 0.0
+    for k in range(1, n + 1):
+        for n_aa in range(k):
+            log_Z_U[k, n_aa] = np.logaddexp(log_Z_U[k - 1, n_aa], log_Z_F[k - 1, n_aa])
+        for i in range(k):
+            n_aa_segmente = k - i
+            dg = E_kontaktu[i, k - 1] - T * S_suma[i, k - 1]
+            terminas_bendras = -beta * dg
+            for n_aa_iki in range(i + 1):
+                if log_Z_U[i, n_aa_iki] != -np.inf:
+                    n_aa_viso = n_aa_iki + n_aa_segmente
+                    terminas = log_Z_U[i, n_aa_iki] + terminas_bendras
+                    log_Z_F[k, n_aa_viso] = np.logaddexp(log_Z_F[k, n_aa_viso], terminas)
+    logZ_profilis = np.full(n + 1, -np.inf, dtype=np.float64)
+    for n_aa in range(n + 1):
+        logZ_profilis[n_aa] = np.logaddexp(log_Z_U[n, n_aa], log_Z_F[n, n_aa])
+    F_profilis = np.full(n + 1, np.inf, dtype=np.float64)
+    for i in range(n + 1):
+        if logZ_profilis[i] != -np.inf:
+            F_profilis[i] = -R * T * logZ_profilis[i]
+    return F_profilis
+
+@njit(cache=True)
+def _gauti_delta_G_unfolding_numba(E_kontaktu, S_suma, R, T, barjeras_idx):
+    F_profilis = _generuoti_Fn_profili_numba(E_kontaktu, S_suma, R, T)
+    beta = 1.0 / (R * T)
+    log_Z_n = -beta * F_profilis
+    acc_U = -np.inf
+    for i in range(barjeras_idx):
+        acc_U = np.logaddexp(acc_U, log_Z_n[i])
+    acc_N = -np.inf
+    for i in range(barjeras_idx, len(log_Z_n)):
+        acc_N = np.logaddexp(acc_N, log_Z_n[i])
+    G_U = -R * T * acc_U
+    G_N = -R * T * acc_N
+    return G_U - G_N
+
+@njit(cache=True)
+def _gauti_delta_H_unfolding_numba(E_kontaktu, S_suma, R, T, dT, barjeras_idx):
+    G_plus  = _gauti_delta_G_unfolding_numba(E_kontaktu, S_suma, R, T + dT, barjeras_idx)
+    G_minus = _gauti_delta_G_unfolding_numba(E_kontaktu, S_suma, R, T - dT, barjeras_idx)
+    dS = -(G_plus - G_minus) / (2.0 * dT)
+    dG = _gauti_delta_G_unfolding_numba(E_kontaktu, S_suma, R, T, barjeras_idx)
+    return dG + T * dS
+
+@njit(cache=True)
+def _build_preentro_from_seqnum(seq_num, entropijos_v):
+    n = len(seq_num)
+    preentro = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        preentro[i] = entropijos_v[seq_num[i]]
+    return preentro
+
+@njit(cache=True)
+def _apply_disulfides(epsilon_matrica, cys_pairs, disulfido_energija):
+    m = cys_pairs.shape[0]
+    for k in range(m):
+        i = cys_pairs[k, 0]
+        j = cys_pairs[k, 1]
+        epsilon_matrica[i, j] += disulfido_energija
+        epsilon_matrica[j, i] += disulfido_energija
+
+@njit(cache=True)
+def _precompute_segments(epsilon_matrica, s_masyvas):
+    n = epsilon_matrica.shape[0]
+    E_kontaktu = np.zeros((n, n), dtype=np.float64)
+    S_suma = np.zeros((n, n), dtype=np.float64)
+    prefix_s = np.empty(n + 1, dtype=np.float64)
+    prefix_s[0] = 0.0
+    for i in range(n):
+        prefix_s[i + 1] = prefix_s[i] + s_masyvas[i]
+    for i in range(n):
+        e_sum = 0.0
+        for j in range(i, n):
+            for a in range(i, j):
+                e_sum += epsilon_matrica[a, j]
+            E_kontaktu[i, j] = e_sum
+            S_suma[i, j] = prefix_s[j + 1] - prefix_s[i]
+    return E_kontaktu, S_suma
+
+@njit(cache=True)
+def sigmoid(x, a1, a2):
+    return 1.0 / (1.0 + np.exp(-np.abs(a1)*x + a2))
+
+@njit(cache=True)
+def scale_by_diag_distance(A, a1, a2):
+    r, c = A.shape
+    out = np.empty_like(A)
+    for i in range(r):
+        for j in range(c):
+            d = abs(i - j)
+            out[i, j] = A[i, j] * sigmoid(d, a1, a2)
+    return out
+
+class WSME_TransferMatrix_V2_NumPyNumba:
+    def __init__(
+        self,
+        n,
+        vdw_matrica,
+        elec_matrica,
+        pol_matrica,
+        npol_matrica,
+        seka,
+        cys_pairs,
+        sasa_masyvas,
+        alpha_vdwB=1.0,
+        alpha_elB=1.0,
+        alpha_polB=1.0,
+        alpha_npolB=1.0,
+        beta_vdw=1.0,
+        m1=1.0,
+        m2=1.0,
+        entropijos_v=None,
+        disulfido_energija=-15.0,
+        alpha_vdw=1.0, alpha_vdwA=4.0,
+        alpha_el=1.0, alpha_elA=4.0,
+        alpha_pol=1.0, alpha_polA=4.0,
+        alpha_npol=1.0, alpha_npolA=4.0,
+    ):
+        self.n = n
+        self.R = 0.001987
+        seka_num = np.array([amino_acid_to_number[aa] for aa in seka], dtype=np.int64)
+        cys_pairs_arr = np.asarray(cys_pairs, dtype=np.int64)
+
+        if entropijos_v is None:
+            entropijos_v = np.zeros(40, dtype=np.float64)
+        a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1,d2,d3,d4,d5 = entropijos_v[-20:]
+        entropijos_v = -np.abs(np.asarray(entropijos_v[:-20], dtype=np.float64)) / 1000.0
+
+        vdw_matrica = np.asarray(vdw_matrica, dtype=np.float64)
+        elec_matrica = np.asarray(elec_matrica, dtype=np.float64)
+        pol_matrica = np.asarray(pol_matrica, dtype=np.float64)
+        npol_matrica = np.asarray(npol_matrica, dtype=np.float64)
+
+        if np.max(np.abs(vdw_matrica)) > 0:
+            vdw_matrica = scale_by_diag_distance(vdw_matrica, alpha_vdw, alpha_vdwA) / np.max(np.abs(vdw_matrica))
+        if np.max(np.abs(elec_matrica)) > 0:
+            elec_matrica = scale_by_diag_distance(elec_matrica, alpha_el, alpha_elA) / np.max(np.abs(elec_matrica))
+        if np.max(np.abs(pol_matrica)) > 0:
+            pol_matrica = scale_by_diag_distance(pol_matrica, alpha_pol, alpha_polA) / np.max(np.abs(pol_matrica))
+        if np.max(np.abs(npol_matrica)) > 0:
+            npol_matrica = scale_by_diag_distance(npol_matrica, alpha_npol, alpha_npolA) / np.max(np.abs(npol_matrica))
+
+        epsilon_matrica = (
+            vdw_matrica * np.abs(alpha_vdwB) * (1 + a1*n + a2*n*n + a3*n*n*n + a4*n*n*n*n + a5) +
+            elec_matrica * np.abs(alpha_elB) * (1 + b1*n + b2*n*n + b3*n*n*n + b4*n*n*n*n + b5) +
+            pol_matrica * np.abs(alpha_polB) * (1 + c1*n + c2*n*n + c3*n*n*n + c4*n*n*n*n + c5) +
+            npol_matrica * np.abs(alpha_npolB) * (1 + d1*n + d2*n*n + d3*n*n*n + d4*n*n*n*n + d5) +
+            beta_vdw
+        )
+
+        epsilon_matrica = np.array(epsilon_matrica, dtype=np.float64, copy=True)
+        if cys_pairs_arr.shape[0] > 0:
+            _apply_disulfides(epsilon_matrica, cys_pairs_arr, -np.abs(disulfido_energija))
+
+        preentro = _build_preentro_from_seqnum(seka_num, entropijos_v)
+        self.s_masyvas = sigmoid((1.0 - sasa_masyvas), m1, m2) * preentro
+
+        self.epsilon_matrica = epsilon_matrica
+        self.E_kontaktu, self.S_suma = _precompute_segments(self.epsilon_matrica, self.s_masyvas)
+
+    def generuoti_Fn_profili(self, T):
+        return _generuoti_Fn_profili_numba(self.E_kontaktu, self.S_suma, self.R, T)
+
+    def gauti_delta_G_unfolding(self, T, barjeras_idx):
+        return _gauti_delta_G_unfolding_numba(self.E_kontaktu, self.S_suma, self.R, T, barjeras_idx)
+
+    def gauti_delta_H_unfolding(self, T, dT=0.2, barjeras_idx=None):
+        return _gauti_delta_H_unfolding_numba(self.E_kontaktu, self.S_suma, self.R, T, dT, barjeras_idx)
+
+
+_skaiciavimu_cache = {}
+
+def skaiciuoti_vieno_baltymo_rezultatus(baltymas, params):
+    params_tuple = tuple(np.round(params, 5))
+    cache_key = (baltymas['PDB_id'], params_tuple)
+    if cache_key in _skaiciavimu_cache:
+        return _skaiciavimu_cache[cache_key]
+
+    alpha_vdwB = params[0]
+    alpha_elB = params[1]
+    alpha_polB = params[2]
+    alpha_npolB = params[3]
+    beta_vdw = params[4]
+    disulfido_energija = params[5]
+    m1 = params[6]
+    m2 = params[7]
+    alpha_vdw = params[8]
+    alpha_vdwA = params[9]
+    alpha_el = params[10]
+    alpha_elA = params[11]
+    alpha_pol = params[12]
+    alpha_polA = params[13]
+    alpha_npol = params[14]
+    alpha_npolA = params[15]
+    barjeras_frac = params[16]
+    sekos_atstumas_float = params[17]
+    global_entropy_scale = params[18]
+    poly_coefs = params[19:39]
+    entropijos_20 = params[39:59] * global_entropy_scale
+    entropijos_v = np.concatenate([entropijos_20, poly_coefs])
+
+    sekos_atstumas = int(round(sekos_atstumas_float))
+
+    kontaktu_matrica = baltymas['kontaktu_baze'].copy()
+    for k in range(sekos_atstumas):
+        np.fill_diagonal(kontaktu_matrica[k:], 0)
+        np.fill_diagonal(kontaktu_matrica[:, k:], 0)
+
+    vdw_mat = baltymas['vdw_raw'] * kontaktu_matrica
+    elec_mat = baltymas['elec_raw'] * kontaktu_matrica
+    pol_mat = baltymas['pol_raw'] * kontaktu_matrica
+    npol_mat = baltymas['npol_raw'] * kontaktu_matrica
+
+    modelis = WSME_TransferMatrix_V2_NumPyNumba(
+        baltymas['ilgis'],
+        vdw_mat, elec_mat, pol_mat, npol_mat,
+        baltymas['seka'], baltymas['cys'], baltymas['sasa'],
+        alpha_vdwB=alpha_vdwB,
+        alpha_elB=alpha_elB,
+        alpha_polB=alpha_polB,
+        alpha_npolB=alpha_npolB,
+        beta_vdw=beta_vdw,
+        m1=m1, m2=m2,
+        entropijos_v=entropijos_v,
+        disulfido_energija=disulfido_energija,
+        alpha_vdw=alpha_vdw, alpha_vdwA=alpha_vdwA,
+        alpha_el=alpha_el, alpha_elA=alpha_elA,
+        alpha_pol=alpha_pol, alpha_polA=alpha_polA,
+        alpha_npol=alpha_npol, alpha_npolA=alpha_npolA,
+    )
+
+    n = baltymas['ilgis']
+    barjeras_idx = int(n * barjeras_frac)
+
+    def dG_T(T):
+        return modelis.gauti_delta_G_unfolding(T, barjeras_idx)
+
+    try:
+        Tm_modelio = root_scalar(dG_T, bracket=[250, 450], method='brentq').root
+    except ValueError:
+        Tm_modelio = np.nan
+
+    dG_298 = modelis.gauti_delta_G_unfolding(298.15, barjeras_idx)
+    dG_Tm_exp = modelis.gauti_delta_G_unfolding(baltymas['Tm_K'], barjeras_idx)
+
+    rez = {
+        'PDB_id': baltymas['PDB_id'],
+        'Tm_modelio': Tm_modelio,
+        'dG_298': dG_298,
+        'dG_Tm_exp': dG_Tm_exp,
+    }
+    _skaiciavimu_cache[cache_key] = rez
+    return rez
+
+
+def globali_tikslo_funkcija(params, duomenys_baltymu, opt_executor=None):
+    dG_exp_list = []
+    dG_calc_list = []
+    Tm_err_sq = 0.0
+    dG_err_sq = 0.0
+    HUBER_DELTA_TM = 30.0
+    HUBER_DELTA_DG = 5.0
+
+    def apdoroti_rezultata(baltymas, rez):
+        nonlocal Tm_err_sq, dG_err_sq
+        Tm_exp = baltymas['Tm_K']
+        Tm_calc = rez['Tm_modelio']
+        if not np.isnan(Tm_calc):
+            err = abs(Tm_calc - Tm_exp)
+            if err > HUBER_DELTA_TM:
+                Tm_err_sq += 2 * HUBER_DELTA_TM * err - HUBER_DELTA_TM**2
+            else:
+                Tm_err_sq += err**2
+
+        dG_exp = baltymas.get('dG')
+        if not pd.isna(dG_exp):
+            dG_calc = rez['dG_298']
+            dG_exp_list.append(dG_exp)
+            dG_calc_list.append(dG_calc)
+            err = abs(dG_calc - dG_exp)
+            if err > HUBER_DELTA_DG:
+                dG_err_sq += 2 * HUBER_DELTA_DG * err - HUBER_DELTA_DG**2
+            else:
+                dG_err_sq += err**2
+
+    if opt_executor is not None:
+        futures = [opt_executor.submit(skaiciuoti_vieno_baltymo_rezultatus, b, params) for b in duomenys_baltymu]
+        results_map = {}
+        for future in as_completed(futures):
+            try:
+                rez = future.result()
+                results_map[rez['PDB_id']] = rez
+            except Exception as e:
+                print(f"Klaida skaičiuojant baltymą: {e}")
+        for baltymas in duomenys_baltymu:
+            rez = results_map.get(baltymas['PDB_id'])
+            if rez is not None:
+                apdoroti_rezultata(baltymas, rez)
+    else:
+        for baltymas in duomenys_baltymu:
+            try:
+                rez = skaiciuoti_vieno_baltymo_rezultatus(baltymas, params)
+                apdoroti_rezultata(baltymas, rez)
+            except Exception as e:
+                print(f"Klaida su {baltymas['PDB_id']}: {e}")
+
+    N_Tm = len(duomenys_baltymu)
+    N_dG = len(dG_exp_list)
+    rmse_Tm = np.sqrt(Tm_err_sq / N_Tm) if N_Tm > 0 else 0.0
+    rmse_dG = np.sqrt(dG_err_sq / N_dG) if N_dG > 0 else 0.0
+
+    r = 0.0
+    if N_dG > 1:
+        r, _ = pearsonr(dG_exp_list, dG_calc_list)
+
+    lambda_Tm = 0.5
+    lambda_dG = 5.0
+    lambda_corr = 20.0
+
+    total_loss = lambda_Tm * rmse_Tm + lambda_dG * rmse_dG - lambda_corr * r
+
+    global iteracija
+    iteracija += 1
+    if iteracija % 10 == 0 or iteracija == 1:
+        print(f"Iter {iteracija}: Loss={total_loss:.3f} | RMSE_Tm={rmse_Tm:.2f} K | RMSE_dG={rmse_dG:.2f} kcal/mol | r={r:.3f}")
+    return total_loss
+
+
+def paruošti_viena_baltyma(row_data):
+    pdb_id = str(row_data['PDB_id']).strip().upper()
+    try:
+        pdb_failas = f"{pdb_id}.pdb"
+        data_dir = os.path.join("saveiku_energija_final", pdb_id, "tarpiniai_failai")
+        failu_sablonas = f"mmpbsa_work_R*/_MMPBSA_complex_gb.mdout.0"
+
+        if not os.path.exists(pdb_failas) or not os.path.exists(data_dir):
+            return None
+
+        vdw_mat, elec_mat, pol_mat, npol_mat, baltymo_ilgis = nuskaityti_mmpbsa_padalinta(data_dir, failu_sablonas)
+        kontaktu_mask, cys_pairs, seka, sasa = gauti_sasa_ir_struktura(
+            pdb_failas, baltymo_ilgis, atstumo_riba=8.0
+        )
+
+        Tm_K = float(str(row_data['Tm_C']).replace(',', '.')) + 273.15
+        dH = parse_energy(row_data.get('dH', np.nan))
+        dG = parse_energy(row_data.get('dG_exp', np.nan))
+
+        return {
+            'PDB_id': pdb_id, 'ilgis': baltymo_ilgis,
+            'vdw_raw': vdw_mat, 'elec_raw': elec_mat,
+            'pol_raw': pol_mat, 'npol_raw': npol_mat,
+            'kontaktu_baze': kontaktu_mask,
+            'seka': seka, 'cys': cys_pairs, 'sasa': sasa,
+            'Tm_K': Tm_K, 'dH': dH, 'dG': dG
+        }
+    except Exception as e:
+        print(f"Klaida ruošiant {pdb_id}: {e}")
+        return None
+
+
+def apskaiciuoti_ir_braizyti_baltyma(baltymas, params, output_dir):
+    pdb_id = baltymas['PDB_id']
+    try:
+        rez = skaiciuoti_vieno_baltymo_rezultatus(baltymas, params)
+        alpha_vdwB = params[0]
+        alpha_elB = params[1]
+        alpha_polB = params[2]
+        alpha_npolB = params[3]
+        beta_vdw = params[4]
+        disulfido_energija = params[5]
+        m1 = params[6]
+        m2 = params[7]
+        alpha_vdw = params[8]
+        alpha_vdwA = params[9]
+        alpha_el = params[10]
+        alpha_elA = params[11]
+        alpha_pol = params[12]
+        alpha_polA = params[13]
+        alpha_npol = params[14]
+        alpha_npolA = params[15]
+        barjeras_frac = params[16]
+        sekos_atstumas_float = params[17]
+        global_entropy_scale = params[18]
+        poly_coefs = params[19:39]
+        entropijos_20 = params[39:59] * global_entropy_scale
+        entropijos_v = np.concatenate([entropijos_20, poly_coefs])
+
+        sekos_atstumas = int(round(sekos_atstumas_float))
+
+        kontaktu_matrica = baltymas['kontaktu_baze'].copy()
+        for k in range(sekos_atstumas):
+            np.fill_diagonal(kontaktu_matrica[k:], 0)
+            np.fill_diagonal(kontaktu_matrica[:, k:], 0)
+
+        vdw_mat = baltymas['vdw_raw'] * kontaktu_matrica
+        elec_mat = baltymas['elec_raw'] * kontaktu_matrica
+        pol_mat = baltymas['pol_raw'] * kontaktu_matrica
+        npol_mat = baltymas['npol_raw'] * kontaktu_matrica
+
+        modelis = WSME_TransferMatrix_V2_NumPyNumba(
+            baltymas['ilgis'],
+            vdw_mat, elec_mat, pol_mat, npol_mat,
+            baltymas['seka'], baltymas['cys'], baltymas['sasa'],
+            alpha_vdwB=alpha_vdwB, alpha_elB=alpha_elB,
+            alpha_polB=alpha_polB, alpha_npolB=alpha_npolB,
+            beta_vdw=beta_vdw, m1=m1, m2=m2,
+            entropijos_v=entropijos_v,
+            disulfido_energija=disulfido_energija,
+            alpha_vdw=alpha_vdw, alpha_vdwA=alpha_vdwA,
+            alpha_el=alpha_el, alpha_elA=alpha_elA,
+            alpha_pol=alpha_pol, alpha_polA=alpha_polA,
+            alpha_npol=alpha_npol, alpha_npolA=alpha_npolA,
+        )
+
+        n = baltymas['ilgis']
+        barjeras_idx = int(n * barjeras_frac)
+
+        Fn_abs_298 = modelis.generuoti_Fn_profili(298.15)
+        Fn_profilis_298 = Fn_abs_298 - Fn_abs_298[0]
+
+        Tm_modelio = rez['Tm_modelio']
+        T_min = max(250, Tm_modelio - 70) if not np.isnan(Tm_modelio) else 250
+        T_max = Tm_modelio + 60 if not np.isnan(Tm_modelio) else 450
+        T_range = np.linspace(T_min, T_max, 100)
+        dG_values = [modelis.gauti_delta_G_unfolding(T, barjeras_idx) for T in T_range]
+
+        fig, (ax2, ax3) = plt.subplots(2, 1, figsize=(10, 10))
+        ax2.plot(T_range, dG_values, '-', color='blue', linewidth=2)
+        ax2.axhline(0, color='black', linewidth=1, linestyle='--')
+        if not np.isnan(Tm_modelio):
+            ax2.plot(Tm_modelio, 0, 'ko')
+            ax2.annotate(f'Tm = {Tm_modelio:.1f} K', xy=(Tm_modelio, 0),
+                         xytext=(Tm_modelio+5, max(dG_values)*0.3),
+                         arrowprops=dict(facecolor='black', shrink=0.05),
+                         bbox=dict(boxstyle="round", fc="white", ec="gray"))
+        ax2.set_xlabel('Temperature (K)')
+        ax2.set_ylabel(r'$\Delta G_{U-N}$ [kcal/mol]')
+        ax2.grid(True, linestyle='--', alpha=0.5)
+        ax2.set_title(f'{pdb_id} (α_vB={alpha_vdwB:.2f}, α_eB={alpha_elB:.2f}, Cys={disulfido_energija:.1f})')
+
+        n_range = np.arange(n + 1)
+        ax3.plot(n_range, Fn_profilis_298, '-', color='purple', linewidth=2)
+        ax3.axvline(barjeras_idx, color='gray', linestyle='--', label=f'Barrier (n={barjeras_idx})')
+        ax3.plot(barjeras_idx, Fn_profilis_298[barjeras_idx], 'k*', markersize=10)
+        ax3.set_title('F(n) at 298.15 K')
+        ax3.set_xlabel('Number of native residues (n)')
+        ax3.set_ylabel('Free energy [kcal/mol]')
+        ax3.legend()
+        ax3.grid(True, linestyle='--', alpha=0.5)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"{pdb_id}_WSME_grafikas.png"), dpi=150)
+        plt.close(fig)
+
+        return {
+            'PDB_id': pdb_id,
+            'Tm_K (Eksp)': baltymas['Tm_K'],
+            'Tm_K (Modelio)': Tm_modelio,
+            'dG_kcal (Eksp)': baltymas['dG'],
+            'dG_298K (Modelio)': rez['dG_298'],
+            'dG_Tm_eksp (Modelio)': rez['dG_Tm_exp'],
+            'Statusas': 'OK'
+        }
+    except Exception as e:
+        return {'PDB_id': pdb_id, 'Statusas': f'Klaida: {str(e)}'}
+
+
+if __name__ == "__main__":
+    OUTPUT_DIR = "WSME_rezultatai"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    csv_file = "priedas_a.csv"
+    if not os.path.exists(csv_file):
+        print(f"KLAIDA: Nerastas failas '{csv_file}'.")
+        exit()
+
+    print(f"1. Skaitomas duomenų failas: {csv_file}")
+    df_priedas = pd.read_csv(csv_file)
+    df_priedas.to_csv(os.path.join(OUTPUT_DIR, "Priedas_A_kopija.csv"), index=False)
+
+    uzduotys = [row for _, row in df_priedas.iterrows()]
+    paruosti_duomenys = []
+    print(f"Ieškoma struktūrų ir mmpbsa matricų {len(uzduotys)} baltymams...")
+    start_time = time.time()
+
+    with ProcessPoolExecutor(max_workers=16) as executor:
+        ateities_pasiruosimai = {executor.submit(paruošti_viena_baltyma, r): r for r in uzduotys}
+        for future in as_completed(ateities_pasiruosimai):
+            res = future.result()
+            if res is not None:
+                paruosti_duomenys.append(res)
+
+    print(f"Duomenų paruošimas baigtas per {(time.time() - start_time):.1f} sek. Sėkmingai pakrauta {len(paruosti_duomenys)} baltymų matricos.")
+
+    if not paruosti_duomenys:
+        print("Klaida: Nepavyko nuskaityti nė vieno baltymo duomenų.")
+        exit()
+
+    pradiniai_params = [
+        1.0, 1.0, 1.0, 1.0,             # alpha_vdwB, alpha_elB, alpha_polB, alpha_npolB
+        0.0, 10.0, 1.0, 0.0,            # beta_vdw, disulfido_energija, m1, m2
+        1.0, 4.0, 1.0, 4.0,             # alpha_vdw, alpha_vdwA, alpha_el, alpha_elA
+        1.0, 4.0, 1.0, 4.0,             # alpha_pol, alpha_polA, alpha_npol, alpha_npolA
+        0.5,                            # barjeras_frac
+        4.0,                            # sekos_atstumas_float
+        1.0,                            # global_entropy_scale
+    ] + [0.0]*20 + [0.005]*20           # 20 poly, 20 entropies
+
+    bounds = [
+        (0.01, 2.0),    # alpha_vdwB
+        (0.01, 2.0),    # alpha_elB
+        (0.01, 2.0),    # alpha_polB
+        (0.01, 2.0),    # alpha_npolB
+        (-2.0, 2.0),    # beta_vdw
+        (1.0, 20.0),    # disulfido_energija
+        (0.1, 20.0),    # m1
+        (-5.0, 5.0),    # m2
+        (0.1, 5.0),     # alpha_vdw
+        (1.0, 10.0),    # alpha_vdwA
+        (0.1, 5.0),     # alpha_el
+        (1.0, 10.0),    # alpha_elA
+        (0.1, 5.0),     # alpha_pol
+        (1.0, 10.0),    # alpha_polA
+        (0.1, 5.0),     # alpha_npol
+        (1.0, 10.0),    # alpha_npolA
+        (0.3, 0.7),     # barjeras_frac
+        (2.0, 8.0),     # sekos_atstumas_float
+        (0.5, 2.0),     # global_entropy_scale
+    ] + [(-1e-3, 1e-3) for _ in range(20)] + [(0.001, 0.05) for _ in range(20)]
+
+    opt_executor = ProcessPoolExecutor(max_workers=16)
+
+    try:
+        print("\n2. Pradedama globali optimizacija (sutrumpinta diferencialinė evoliucija)...")
+        iteracija = 0
+        rezultatas_de = differential_evolution(
+            globali_tikslo_funkcija,
+            bounds,
+            args=(paruosti_duomenys, opt_executor),
+            maxiter=40,
+            popsize=5,
+            disp=True,
+            seed=42,
+            polish=False,
+            workers=1  
+        )
+        print("Sutrumpinta globali optimizacija baigta.")
+
+        print("\n3. Tikslinimas L-BFGS-B...")
+        rezultatas_lbfgs = minimize(
+            globali_tikslo_funkcija,
+            rezultatas_de.x,
+            args=(paruosti_duomenys, opt_executor),
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 300, 'disp': True}
+        )
+    finally:
+        opt_executor.shutdown()  
+
+    final_params = rezultatas_lbfgs.x
+
+    print("\n" + "="*50)
+    print("OPTIMIZACIJA BAIGTA. GALUTINIAI PARAMETRAI:")
+    print(f"alpha_vdwB = {final_params[0]:.4f}, alpha_elB = {final_params[1]:.4f}")
+    print(f"alpha_polB = {final_params[2]:.4f}, alpha_npolB = {final_params[3]:.4f}")
+    print(f"beta_vdw   = {final_params[4]:.4f}, disulfido_energija = {final_params[5]:.4f}")
+    print(f"m1 = {final_params[6]:.4f}, m2 = {final_params[7]:.4f}")
+    print(f"alpha_vdw = {final_params[8]:.4f}, alpha_vdwA = {final_params[9]:.4f}")
+    print(f"alpha_el = {final_params[10]:.4f}, alpha_elA = {final_params[11]:.4f}")
+    print(f"alpha_pol = {final_params[12]:.4f}, alpha_polA = {final_params[13]:.4f}")
+    print(f"alpha_npol = {final_params[14]:.4f}, alpha_npolA = {final_params[15]:.4f}")
+    print(f"barjeras_frac = {final_params[16]:.4f}, sekos_atstumas = {int(round(final_params[17]))}")
+    print(f"global_entropy_scale = {final_params[18]:.4f}")
+    print("Polinominiai koef. (a1..a5, b1..b5, c1..c5, d1..d5):", np.round(final_params[19:39], 6))
+    print("Visos 20 entropijų:", np.round(final_params[39:59], 5))
+    print("="*50)
+
+    print("\n4. Skaičiuojami galutiniai rezultatai ir braižomi grafikai...")
+    rezultatai = []
+    with ProcessPoolExecutor(max_workers=16) as plot_executor:
+        futures = [plot_executor.submit(apskaiciuoti_ir_braizyti_baltyma, b, final_params, OUTPUT_DIR) for b in paruosti_duomenys]
+        for future in as_completed(futures):
+            rez = future.result()
+            if rez['Statusas'] == 'OK':
+                print(f"{rez['PDB_id']}: Tm_exp={rez['Tm_K (Eksp)']:.1f} K, Tm_calc={rez['Tm_K (Modelio)']:.1f} K, "
+                      f"dG_exp={rez['dG_kcal (Eksp)']:.2f}, dG_calc={rez['dG_298K (Modelio)']:.2f}")
+            else:
+                print(f"{rez['PDB_id']}: {rez['Statusas']}")
+            rezultatai.append(rez)
+
+    df_rez = pd.DataFrame(rezultatai)
+    df_rez.to_csv(os.path.join(OUTPUT_DIR, "WSME_Globalus_Rezultatai.csv"), index=False)
+
+    valid_dg = df_rez.dropna(subset=['dG_kcal (Eksp)', 'dG_298K (Modelio)'])
+    if len(valid_dg) > 1:
+        kor, _ = pearsonr(valid_dg['dG_kcal (Eksp)'], valid_dg['dG_298K (Modelio)'])
+    else:
+        kor = np.nan
+
+    end_time = time.time()
+    print("\n" + "="*60)
+    print(f"VISAS SKAIČIAVIMAS BAIGTAS PER {(end_time - start_time):.1f} SEK.")
+    print(f"Galutinė Pearson koreliacija tarp eksp. ir modelio dG(298 K): {kor:.3f}")
+    print("="*60)
